@@ -187,7 +187,7 @@ if [[ $MODE == live* ]]; then  # 系統聲音：audiotee（process tap，--mute 
   # launchctl asuser：從背景服務啟動時也要進使用者的登入 session，系統錄音權限才找得到
   launchctl asuser $(id -u $AS_USER) sudo -u $AS_USER $DIR/audiotee/.build/release/audiotee --stereo --sample-rate 44100 \
       --chunk-duration 0.02 --mute $EXCL 2> $LOGS/pair-$STAMP-tap.log |
-    $TOOL split --routes $RUN/routes --start-ms $T $OUTS 2> $LOGS/pair-$STAMP-split.log &
+    $TOOL split --routes $RUN/routes --eq ${EQFILE:-$DIR/state/eq} --start-ms $T $OUTS 2> $LOGS/pair-$STAMP-split.log &
   PIDS+=($!)
   if [[ $MODE == livemeasure ]]; then  # 用 afplay 播 chirp，量端到端延遲（播放呼叫 → 麥克風）與左右偏差
     REC=$LOGS/pair-$STAMP-mic.wav

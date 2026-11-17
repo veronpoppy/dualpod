@@ -6,6 +6,8 @@
 //   stereotool sleepuntil <unix_ms> <offset>  睡到那個時刻
 //   stereotool split [--routes <檔>] [--start-ms <T>] <路徑:聲道>…   stdin 的 s16le 44.1 kHz 立體聲拆給各輸出：L、R（複製成雙聲道）、LR（原樣）、
 //                                           0（寫靜音，時間軸照走）、X（關掉 fd，之後不再寫）
+//   split --eq <檔>：三段等化器「低 中 高」各 -12…12 dB 的整數（例「4 0 -2」），約每 200 ms 看一次有沒有變，變了立刻套用；
+//                                           檔不在或格式不對就不處理（原音）。拆聲道前套用，所以每個輸出聽到的音色一樣、對時不受影響
 //   stereotool glowart <out.jpg> <RRGGBB>…   寫 512x512 sRGB JPEG，1 到 3 個顏色等寬直條。HomePod 的 Sound Glow 從 Now Playing 封面取主色，
 //                                           這張圖就是拿來指定光暈顏色的
 //   --routes 檔內容是空白分隔的「路徑:聲道」，約每 100 ms 看一次有沒有變，變了就套用到已開啟的輸出（不認得的路徑略過）；
@@ -76,10 +78,12 @@ func glowart(out: String, hex: [String]) {
 func split(_ argv: [String]) {
     var specs = argv
     var routesFile: String?
+    var eqFile: String?
     var startMs: Int64?
-    while let opt = specs.first, opt == "--routes" || opt == "--start-ms" {
+    while let opt = specs.first, opt == "--routes" || opt == "--start-ms" || opt == "--eq" {
         guard specs.count >= 2 else { usage() }
-        if opt == "--routes" { routesFile = specs[1] } else if let t = Int64(specs[1]) { startMs = t } else { usage() }
+        if opt == "--routes" { routesFile = specs[1] } else if opt == "--eq" { eqFile = specs[1] }
+        else if let t = Int64(specs[1]) { startMs = t } else { usage() }
         specs.removeFirst(2)
     }
     let fs = 44100.0
@@ -220,6 +224,22 @@ func split(_ argv: [String]) {
         markActive()
     }
 
+    let eq = Equalizer(fs: fs)
+    var eqSig = "", eqPoll: Int64 = 0
+    func pollEq(_ now: Int64) {
+        guard let file = eqFile, now - eqPoll >= 200_000_000 else { return }
+        eqPoll = now
+        var st = stat()
+        let sig = stat(file, &st) == 0 ? "\(st.st_mtimespec.tv_sec).\(st.st_mtimespec.tv_nsec) \(st.st_ino)" : "none"
+        guard sig != eqSig else { return }
+        eqSig = sig
+        let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
+        let g = text.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
+        if g.count == 3, g.allSatisfy({ (-12...12).contains($0) }) { eq.set(g.map(Double.init)) } else { eq.set([0, 0, 0]) }
+        err("split: eq \(eq.gains.map { Int($0) })")
+    }
+    var eqBuf: [Int16] = []
+
     _ = fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK)
     let t0 = rawNs()
     var tv = timespec()
@@ -236,6 +256,7 @@ func split(_ argv: [String]) {
         if n > 0 { pending.append(contentsOf: buf[0..<n]) }
         let nowNs = rawNs()
         pollRoutes(nowNs)
+        pollEq(nowNs)
         let elapsed = Double(nowNs - t0) / 1e9
         let due = Int(elapsed * fs)  // 照牆鐘此刻應該輸出到第幾個 frame
         let frames = pending.count / 4
@@ -245,7 +266,12 @@ func split(_ argv: [String]) {
             if take > 0 {  // 丟最舊的、留最新的，延遲才不會被拉長
                 pending.withUnsafeBytes { raw in
                     let s = raw.bindMemory(to: Int16.self)
-                    emitAdvancing(UnsafeBufferPointer(rebasing: s[(frames - take) * 2 ..< frames * 2]))
+                    let slice = UnsafeBufferPointer(rebasing: s[(frames - take) * 2 ..< frames * 2])
+                    if eq.flat { emitAdvancing(slice); return }
+                    eqBuf.removeAll(keepingCapacity: true)
+                    eqBuf.append(contentsOf: slice)
+                    eqBuf.withUnsafeMutableBufferPointer { eq.process($0) }
+                    eqBuf.withUnsafeBufferPointer { emitAdvancing($0) }
                 }
             }
             pending.removeFirst(frames * 4)
@@ -262,6 +288,68 @@ func split(_ argv: [String]) {
                        Double(silenceFrames) / fs * 1000, Double(droppedFrames) / fs * 1000))
             silenceFrames = 0
             droppedFrames = 0
+        }
+    }
+}
+
+/// 三段等化器：低音 low shelf 100 Hz、中音 peaking 1 kHz、高音 high shelf 8 kHz（RBJ Audio EQ Cookbook）。
+/// 有任何一段提高時整體先降同樣的 dB 留餘裕，否則大聲的歌一提低音就削波爆音；最後仍超出就硬限幅。
+/// 左右聲道各自一組濾波器狀態，改設定時保留狀態，只換係數，切換不會有一聲爆音
+final class Equalizer {
+    struct Biquad { var b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0 }
+    let fs: Double
+    private(set) var gains = [0.0, 0.0, 0.0]
+    private(set) var flat = true
+    private var bands = [Biquad](repeating: Biquad(), count: 3)
+    private var z = [Double](repeating: 0, count: 3 * 2 * 2)  // band × 聲道 × (z1, z2)，transposed direct form II
+    private var pre = 1.0
+    init(fs: Double) { self.fs = fs }
+
+    func set(_ g: [Double]) {
+        gains = g
+        let wasFlat = flat
+        flat = g.allSatisfy { $0 == 0 }
+        if flat { return }
+        if wasFlat { z = z.map { _ in 0 } }  // 從原音切回來：舊狀態是很久以前的，清掉
+        bands = [shelf(100, g[0], high: false), peak(1000, g[1], q: 0.7), shelf(8000, g[2], high: true)]
+        pre = pow(10, -max(0, g.max() ?? 0) / 20)
+    }
+
+    private func shelf(_ f: Double, _ db: Double, high: Bool) -> Biquad {
+        let a = pow(10, db / 40), w = 2 * Double.pi * f / fs, c = cos(w)
+        let alpha = sin(w) / 2 * sqrt(2)  // 斜率 S = 1
+        let k = 2 * sqrt(a) * alpha
+        let sgn = high ? -1.0 : 1.0
+        let b0 = a * ((a + 1) - sgn * (a - 1) * c + k)
+        let b1 = sgn * 2 * a * ((a - 1) - sgn * (a + 1) * c)
+        let b2 = a * ((a + 1) - sgn * (a - 1) * c - k)
+        let a0 = (a + 1) + sgn * (a - 1) * c + k
+        let a1 = -sgn * 2 * ((a - 1) + sgn * (a + 1) * c)
+        let a2 = (a + 1) + sgn * (a - 1) * c - k
+        return Biquad(b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0)
+    }
+    private func peak(_ f: Double, _ db: Double, q: Double) -> Biquad {
+        let a = pow(10, db / 40), w = 2 * Double.pi * f / fs, alpha = sin(w) / (2 * q), c = cos(w)
+        let a0 = 1 + alpha / a
+        return Biquad(b0: (1 + alpha * a) / a0, b1: -2 * c / a0, b2: (1 - alpha * a) / a0,
+                      a1: -2 * c / a0, a2: (1 - alpha / a) / a0)
+    }
+
+    /// pcm：交錯的 L, R，原地處理
+    func process(_ pcm: UnsafeMutableBufferPointer<Int16>) {
+        var i = 0
+        while i < pcm.count {
+            let ch = i & 1
+            var x = Double(pcm[i]) * pre
+            for b in 0..<3 {
+                let q = bands[b], zi = (b * 2 + ch) * 2
+                let y = q.b0 * x + z[zi]
+                z[zi] = q.b1 * x - q.a1 * y + z[zi + 1]
+                z[zi + 1] = q.b2 * x - q.a2 * y
+                x = y
+            }
+            pcm[i] = Int16(max(-32768, min(32767, x.rounded())))
+            i += 1
         }
     }
 }

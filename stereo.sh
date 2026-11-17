@@ -16,6 +16,7 @@ LOG=$LOGDIR/stereo.log
 PIDFILE=$STATE/supervisor.pid
 DEVFILE=$STATE/devices  # supervisor 正在播的裝置組合
 VOLFILE=$STATE/volumes   # 各台 HomePod 音量，serve 從使用者的音量檔整理後寫入
+EQFILE=$STATE/eq  # 等化器「低 中 高」dB，serve 從使用者的 eq 檔驗過後寫入；播放中 stereotool split 自己會看到變動
 RUNDIR_FILE=$STATE/rundir  # 目前 run_pair 的暫存資料夾（裡面有每台的 cmd 管道）
 SPEAKERS=$STATE/speakers  # 找到的喇叭：「ID<tab>IP<tab>名稱」，App 也讀這份
 DEVICES=${DEVICES:-}
@@ -466,6 +467,14 @@ case ${1:-status} in
           else vdone=""  # 播放中加入的那台也要收到存成 0 的音量
           fi
         fi
+      fi
+      # 等化器：三個 -12…12 的整數，格式不對就當原音。播放中改也不用重啟，split 約 200 ms 內自己讀到
+      eseen=$(stat -f '%Fm %i' $dir/eq 2>/dev/null)
+      if [[ $eseen != ${elast-x} ]]; then
+        elast=$eseen
+        e=(${=$(read_user $dir/eq | tr -c -- '-0-9' ' ')})
+        if (( $#e == 3 )) && [[ ${e[1]} == (|-)<0-12> && ${e[2]} == (|-)<0-12> && ${e[3]} == (|-)<0-12> ]]; then e="$e"; else e="0 0 0"; fi
+        print -r -- $e > $EQFILE.tmp && mv -f $EQFILE.tmp $EQFILE
       fi
       # 音量（如「<喇叭 ID>=40 …」）：只認喇叭 ID、0–100 的整數，整理後原子寫到 root 的 VOLFILE 給起播用
       vseen=$(stat -f '%Fm %i' $dir/volume 2>/dev/null)

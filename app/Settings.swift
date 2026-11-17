@@ -7,6 +7,19 @@ import SwiftUI
 let leftFile = wantFile.deletingLastPathComponent().appendingPathComponent("left")
 let syncFile = wantFile.deletingLastPathComponent().appendingPathComponent("mac-sync-ms")
 let glowFile = wantFile.deletingLastPathComponent().appendingPathComponent("glow")
+// Equalizer "bass mid treble" in dB, -12…12 each; the service checks it and the stream picks it up within a moment
+let eqFile = wantFile.deletingLastPathComponent().appendingPathComponent("eq")
+func parseEq(_ raw: String) -> [Int] {
+    let g = raw.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
+    return g.count == 3 && g.allSatisfy({ (-12...12).contains($0) }) ? g : [0, 0, 0]
+}
+let eqPresets: [(en: String, zh: String, gains: [Int])] = [
+    ("Flat", "原音", [0, 0, 0]),
+    ("Bass Boost", "加強低音", [6, 0, 0]),
+    ("Vocal", "人聲", [-2, 4, 1]),
+    ("Bright", "明亮", [0, 0, 5]),
+    ("Late Night", "夜間小聲", [-4, 2, -2]),
+]
 let alignRestoreFile = wantFile.deletingLastPathComponent().appendingPathComponent("align-restore")
 
 func readSetting(_ url: URL) -> String {
@@ -86,6 +99,16 @@ final class SettingsModel: ObservableObject {
     @Published var foundTag: String? { didSet { onUpdateChange() } }  // newest release seen; stays while checking again
     var onUpdateChange: () -> Void = {}
     /// "off", "preset:<name>" or "custom:#RRGGBB"; the service reads it when playback starts and when it changes
+    @Published private(set) var eq = parseEq(readSetting(eqFile))
+    func setEq(_ band: Int, _ db: Int) {
+        var g = eq
+        g[band] = max(-12, min(12, db))
+        setEq(g)
+    }
+    func setEq(_ g: [Int]) {
+        guard g != eq else { return }
+        if writeSetting(eqFile, g.map(String.init).joined(separator: " ")) { eq = g }
+    }
     @Published private(set) var glow = parseGlow(readGlowFile())
     /// Saves first and updates the UI only if that worked, so a failed write leaves the old state and picking again retries
     func setGlow(_ v: String) {
@@ -264,10 +287,45 @@ struct AudioPane: View {
                      : t("The Mac plays \(model.sync) ms later than the HomePods.", "Mac 比 HomePod 晚 \(model.sync) ms 播。"))
                     .foregroundStyle(.secondary)
             }
+            Section {
+                eqBand(0, t("Bass", "低音"), "100 Hz")
+                eqBand(1, t("Mid", "中音"), "1 kHz")
+                eqBand(2, t("Treble", "高音"), "8 kHz")
+                LabeledContent(t("Preset", "預設")) {
+                    Picker(t("Preset", "預設"), selection: Binding(
+                        get: { eqPresets.firstIndex { $0.gains == model.eq } ?? -1 },
+                        set: { if eqPresets.indices.contains($0) { model.setEq(eqPresets[$0].gains) } })) {
+                        if !eqPresets.contains(where: { $0.gains == model.eq }) { Text(t("Custom", "自訂")).tag(-1) }
+                        ForEach(eqPresets.indices, id: \.self) { Text(t(eqPresets[$0].en, eqPresets[$0].zh)).tag($0) }
+                    }
+                    .labelsHidden().fixedSize()
+                }
+            } header: {
+                Text(t("Equalizer", "等化器"))
+            } footer: {
+                Text(t("Applies to every speaker, including this Mac, within a moment. Raising a band lowers everything a little so loud songs don't distort.",
+                       "套用到所有喇叭（含這台 Mac），調了馬上生效。調高任一段時整體會小聲一點，避免爆音。"))
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func eqBand(_ band: Int, _ name: String, _ freq: String) -> some View {
+        LabeledContent {
+            HStack(spacing: 8) {
+                Slider(value: Binding(get: { Double(model.eq[band]) }, set: { model.setEq(band, Int($0.rounded())) }),
+                       in: -12...12, step: 1)
+                    .frame(width: 200)
+                Text(model.eq[band] > 0 ? "+\(model.eq[band]) dB" : "\(model.eq[band]) dB")
+                    .monospacedDigit().foregroundStyle(.secondary).frame(width: 50, alignment: .trailing)
+            }
+        } label: {
+            Text(name)
+            Text(freq)
+        }
     }
 
     /// Like the Home app's stereo pair screen: the left speaker on the left, the right one on the right.
