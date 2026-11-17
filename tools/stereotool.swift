@@ -6,7 +6,7 @@
 //   stereotool sleepuntil <unix_ms> <offset>  睡到那個時刻
 //   stereotool split [--routes <檔>] [--start-ms <T>] <路徑:聲道>…   stdin 的 s16le 44.1 kHz 立體聲拆給各輸出：L、R（複製成雙聲道）、LR（原樣）、
 //                                           0（寫靜音，時間軸照走）、X（關掉 fd，之後不再寫）
-//   split --eq <檔>：三段等化器「低 中 高」各 -12…12 dB 的整數（例「4 0 -2」），約每 200 ms 看一次有沒有變，變了立刻套用；
+//   split --eq <檔>：五段等化器「80 250 1k 4k 12k Hz」各 -12…12 dB 的整數（例「3 0 0 1 2」；舊的三段「低 中 高」也收），約每 200 ms 看一次有沒有變，變了立刻套用；
 //                                           檔不在或格式不對就不處理（原音）。拆聲道前套用，所以每個輸出聽到的音色一樣、對時不受影響
 //   stereotool glowart <out.jpg> <RRGGBB>…   寫 512x512 sRGB JPEG，1 到 3 個顏色等寬直條。HomePod 的 Sound Glow 從 Now Playing 封面取主色，
 //                                           這張圖就是拿來指定光暈顏色的
@@ -235,7 +235,9 @@ func split(_ argv: [String]) {
         eqSig = sig
         let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
         let g = text.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
-        if g.count == 3, g.allSatisfy({ (-12...12).contains($0) }) { eq.set(g.map(Double.init)) } else { eq.set([0, 0, 0]) }
+        let ok = (g.count == 3 || g.count == 5) && g.allSatisfy({ (-12...12).contains($0) })
+        let five = !ok ? [0, 0, 0, 0, 0] : g.count == 5 ? g : [g[0], 0, g[1], 0, g[2]]
+        eq.set(five.map(Double.init))
         err("split: eq \(eq.gains.map { Int($0) })")
     }
     var eqBuf: [Int16] = []
@@ -292,16 +294,18 @@ func split(_ argv: [String]) {
     }
 }
 
-/// 三段等化器：低音 low shelf 100 Hz、中音 peaking 1 kHz、高音 high shelf 8 kHz（RBJ Audio EQ Cookbook）。
-/// 有任何一段提高時整體先降同樣的 dB 留餘裕，否則大聲的歌一提低音就削波爆音；最後仍超出就硬限幅。
+/// 五段等化器：80 Hz low shelf、250 Hz／1 kHz／4 kHz peaking、12 kHz high shelf（RBJ Audio EQ Cookbook）。
+/// 整體先降「五段疊起來的最高增益」留餘裕（在 20 Hz–20 kHz 掃一遍算出來），否則大聲的歌一提低音就削波爆音；
+/// 只降真正需要的量，相鄰兩段一起提也不會爆。最後仍超出就硬限幅。
 /// 左右聲道各自一組濾波器狀態，改設定時保留狀態，只換係數，切換不會有一聲爆音
 final class Equalizer {
     struct Biquad { var b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0 }
     let fs: Double
-    private(set) var gains = [0.0, 0.0, 0.0]
+    static let n = 5
+    private(set) var gains = [Double](repeating: 0, count: n)
     private(set) var flat = true
-    private var bands = [Biquad](repeating: Biquad(), count: 3)
-    private var z = [Double](repeating: 0, count: 3 * 2 * 2)  // band × 聲道 × (z1, z2)，transposed direct form II
+    private var bands = [Biquad](repeating: Biquad(), count: n)
+    private var z = [Double](repeating: 0, count: n * 2 * 2)  // band × 聲道 × (z1, z2)，transposed direct form II
     private var pre = 1.0
     init(fs: Double) { self.fs = fs }
 
@@ -311,8 +315,24 @@ final class Equalizer {
         flat = g.allSatisfy { $0 == 0 }
         if flat { return }
         if wasFlat { z = z.map { _ in 0 } }  // 從原音切回來：舊狀態是很久以前的，清掉
-        bands = [shelf(100, g[0], high: false), peak(1000, g[1], q: 0.7), shelf(8000, g[2], high: true)]
-        pre = pow(10, -max(0, g.max() ?? 0) / 20)
+        bands = [shelf(80, g[0], high: false), peak(250, g[1], q: 1), peak(1000, g[2], q: 1),
+                 peak(4000, g[3], q: 1), shelf(12000, g[4], high: true)]
+        var peakDb = 0.0
+        for i in 0...240 {  // 20 Hz 到 20 kHz，對數間隔
+            let f = 20 * pow(1000, Double(i) / 240)
+            peakDb = max(peakDb, bands.reduce(0) { $0 + response($1, f) })
+        }
+        pre = pow(10, -peakDb / 20)
+    }
+
+    /// 一個 biquad 在頻率 f 的增益（dB）
+    func response(_ q: Biquad, _ f: Double) -> Double {
+        let w = 2 * Double.pi * f / fs
+        func mag2(_ c0: Double, _ c1: Double, _ c2: Double) -> Double {
+            let re = c0 + c1 * cos(w) + c2 * cos(2 * w), im = -(c1 * sin(w) + c2 * sin(2 * w))
+            return re * re + im * im
+        }
+        return 10 * log10(mag2(q.b0, q.b1, q.b2) / mag2(1, q.a1, q.a2))
     }
 
     private func shelf(_ f: Double, _ db: Double, high: Bool) -> Biquad {
@@ -341,7 +361,7 @@ final class Equalizer {
         while i < pcm.count {
             let ch = i & 1
             var x = Double(pcm[i]) * pre
-            for b in 0..<3 {
+            for b in 0..<Self.n {
                 let q = bands[b], zi = (b * 2 + ch) * 2
                 let y = q.b0 * x + z[zi]
                 z[zi] = q.b1 * x - q.a1 * y + z[zi + 1]

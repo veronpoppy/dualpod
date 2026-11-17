@@ -7,18 +7,19 @@ import SwiftUI
 let leftFile = wantFile.deletingLastPathComponent().appendingPathComponent("left")
 let syncFile = wantFile.deletingLastPathComponent().appendingPathComponent("mac-sync-ms")
 let glowFile = wantFile.deletingLastPathComponent().appendingPathComponent("glow")
-// Equalizer "bass mid treble" in dB, -12…12 each; the service checks it and the stream picks it up within a moment
+// Equalizer, five bands (80 Hz, 250 Hz, 1 kHz, 4 kHz, 12 kHz) in dB, -12…12 each; the service checks it and the stream picks it up within a moment
 let eqFile = wantFile.deletingLastPathComponent().appendingPathComponent("eq")
 func parseEq(_ raw: String) -> [Int] {
     let g = raw.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
-    return g.count == 3 && g.allSatisfy({ (-12...12).contains($0) }) ? g : [0, 0, 0]
+    guard (g.count == 3 || g.count == 5), g.allSatisfy({ (-12...12).contains($0) }) else { return [0, 0, 0, 0, 0] }
+    return g.count == 5 ? g : [g[0], 0, g[1], 0, g[2]]  // an older three-band setting
 }
 let eqPresets: [(en: String, zh: String, gains: [Int])] = [
-    ("Flat", "原音", [0, 0, 0]),
-    ("Bass Boost", "加強低音", [6, 0, 0]),
-    ("Vocal", "人聲", [-2, 4, 1]),
-    ("Bright", "明亮", [0, 0, 5]),
-    ("Late Night", "夜間小聲", [-4, 2, -2]),
+    ("Flat", "原音", [0, 0, 0, 0, 0]),
+    ("Bass Boost", "加強低音", [4, 2, 0, 0, 0]),
+    ("Vocal", "人聲", [-2, -1, 2, 2, 0]),
+    ("Bright", "明亮", [0, 0, 0, 2, 3]),
+    ("Late Night", "夜間小聲", [-4, -2, 1, 0, -2]),
 ]
 let alignRestoreFile = wantFile.deletingLastPathComponent().appendingPathComponent("align-restore")
 
@@ -288,9 +289,11 @@ struct AudioPane: View {
                     .foregroundStyle(.secondary)
             }
             Section {
-                eqBand(0, t("Bass", "低音"), "100 Hz")
-                eqBand(1, t("Mid", "中音"), "1 kHz")
-                eqBand(2, t("Treble", "高音"), "8 kHz")
+                eqBand(0, t("Bass", "低音"), "80 Hz")
+                eqBand(1, t("Low Mid", "中低"), "250 Hz")
+                eqBand(2, t("Mid", "中音"), "1 kHz")
+                eqBand(3, t("High Mid", "中高"), "4 kHz")
+                eqBand(4, t("Treble", "高音"), "12 kHz")
                 LabeledContent(t("Preset", "預設")) {
                     Picker(t("Preset", "預設"), selection: Binding(
                         get: { eqPresets.firstIndex { $0.gains == model.eq } ?? -1 },
