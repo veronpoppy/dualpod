@@ -162,6 +162,17 @@ final class App: NSObject, NSApplicationDelegate {
     let lastLine = NSMenuItem()
     var rows: [String: DeviceRow] = [:]
     var homeVolume: [String: Int] = [:]  // speaker id → 0…100; 35 until set
+    // "All" row: one slider for every output that is playing. It scales them together and keeps their balance:
+    // the ratios are taken when the master starts moving and dropped as soon as a single slider moves.
+    let masterItem = NSMenuItem()
+    var masterRow: DeviceRow!
+    var masterBase: [String: Double]?  // device → volume as a share of the loudest, while the master moves
+    // Left/right link: moving one HomePod of the pair moves the other by the same amount
+    let linkItem = NSMenuItem(title: "", action: #selector(toggleLink), keyEquivalent: "")
+    var linkPair: Bool {
+        get { UserDefaults.standard.object(forKey: "linkPair") as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: "linkPair") }
+    }
     let settingsItem = NSMenuItem(title: "", action: #selector(openSettings), keyEquivalent: ",")
     let updateItem = NSMenuItem(title: "", action: #selector(openUpdatePage), keyEquivalent: "")
     let settings = SettingsModel()
@@ -182,7 +193,14 @@ final class App: NSObject, NSApplicationDelegate {
         updateItem.target = self
         menu.addItem(updateItem)
         menu.addItem(header)
+        masterRow = DeviceRow(symbol: "speaker.wave.2.fill", onToggle: {},
+                              onVolume: { [weak self] v in self?.setMaster(v) })
+        masterRow.isOn = true
+        masterItem.view = masterRow
+        menu.addItem(masterItem)
         syncRows()
+        linkItem.target = self
+        menu.addItem(linkItem)
         menu.delegate = self
         menu.addItem(.separator())
         lastLine.isEnabled = false
@@ -223,7 +241,7 @@ final class App: NSObject, NSApplicationDelegate {
         for (_, mi) in deviceItems { menu.removeItem(mi) }
         deviceItems = [:]
         rows = [:]
-        var at = menu.index(of: header) + 1
+        var at = menu.index(of: masterItem) + 1
         for d in devices {
             let row = DeviceRow(symbol: speakers.first { $0.id == d }?.symbol ?? "laptopcomputer",
                                 onToggle: { [weak self] in self?.toggleDevice(d) },
@@ -332,6 +350,15 @@ final class App: NSObject, NSApplicationDelegate {
         } else {
             updateItem.isHidden = true
         }
+        // The master only makes sense with two or more outputs; the link only with the stereo pair
+        let on = devices.filter { shown.contains($0) }
+        masterItem.isHidden = on.count < 2
+        masterRow.setTitle(t("All", "全部"), "")
+        masterRow.enabled = !missing
+        if masterBase == nil { masterRow.slider.doubleValue = masterLevel() }
+        linkItem.isHidden = pair.count != 2
+        linkItem.title = t("Link Left and Right Volume", "左右聲道音量連動")
+        linkItem.state = linkPair ? .on : .off
         settingsItem.title = t("Settings…", "設定…")
         let playing = actual.filter { $0 != "Mac" }.sorted()
         if settings.playing != playing { settings.playing = playing }
@@ -423,13 +450,55 @@ final class App: NSObject, NSApplicationDelegate {
         rows["Mac"]?.slider.doubleValue = Double(macVolume)
     }
 
+    /// One device's slider moved. With the link on, the other half of the stereo pair follows by the same amount.
     func setVolume(_ device: String, _ value: Double) {
-        if device == "Mac" { macVolume = Float(value); return }
-        homeVolume[device] = Int((value * 100).rounded())
+        masterBase = nil
+        if device == "Mac" { macVolume = Float(value) } else {
+            let new = Int((value * 100).rounded())
+            let pair = playingPair()
+            if linkPair, pair.count == 2, pair.contains(device), let other = pair.first(where: { $0 != device }) {
+                let delta = new - (homeVolume[device] ?? 35)
+                let follow = min(100, max(0, (homeVolume[other] ?? 35) + delta))
+                homeVolume[other] = follow
+                rows[other]?.slider.doubleValue = Double(follow) / 100
+            }
+            homeVolume[device] = new
+            writeVolumes()
+        }
+        masterRow.slider.doubleValue = masterLevel()
+    }
+
+    func writeVolumes() {
         let text = homeVolume.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
         try? FileManager.default.createDirectory(
             at: volumeFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? (text + "\n").write(to: volumeFile, atomically: true, encoding: .utf8)
+    }
+
+    func playingPair() -> [String] { (pending?.want ?? actual).filter { $0 != "Mac" }.sorted() }
+    func playingOutputs() -> [String] { devices.filter { (pending?.want ?? actual).contains($0) } }
+    func level(_ d: String) -> Double { d == "Mac" ? Double(macVolume) : Double(homeVolume[d] ?? 35) / 100 }
+    /// The master sits at the loudest output, so dragging it to the top brings that one to 100.
+    func masterLevel() -> Double { playingOutputs().map(level).max() ?? 0 }
+
+    func setMaster(_ value: Double) {
+        let outs = playingOutputs()
+        if masterBase == nil {
+            let top = outs.map(level).max() ?? 0
+            // everything at 0: no balance left to keep, so they rise together
+            masterBase = Dictionary(uniqueKeysWithValues: outs.map { ($0, top > 0 ? level($0) / top : 1) })
+        }
+        for d in outs {
+            let v = min(1, max(0, value * (masterBase?[d] ?? 1)))
+            if d == "Mac" { macVolume = Float(v) } else { homeVolume[d] = Int((v * 100).rounded()) }
+            rows[d]?.slider.doubleValue = v
+        }
+        writeVolumes()
+    }
+
+    @objc func toggleLink() {
+        linkPair.toggle()
+        render(lastStatus)
     }
 
     let aligner = AutoAlign()
@@ -694,7 +763,11 @@ final class App: NSObject, NSApplicationDelegate {
 
 extension App: NSMenuDelegate {
     // The system volume can change from the keyboard while the menu is closed
-    func menuWillOpen(_ menu: NSMenu) { rows["Mac"]?.slider.doubleValue = Double(macVolume) }
+    func menuWillOpen(_ menu: NSMenu) {
+        rows["Mac"]?.slider.doubleValue = Double(macVolume)
+        masterBase = nil
+        masterRow.slider.doubleValue = masterLevel()
+    }
 }
 
 @main
