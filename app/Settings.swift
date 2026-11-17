@@ -16,10 +16,12 @@ func parseEq(_ raw: String) -> [Int] {
 }
 let eqPresets: [(en: String, zh: String, gains: [Int])] = [
     ("Flat", "原音", [0, 0, 0, 0, 0]),
+    // 小喇叭（HomePod mini）的起點：降一點 250 Hz 去悶，比拉高低音省音量
+    ("Music", "聽音樂", [2, -1, 0, 1, 1]),
+    ("Movies & Podcasts", "影片／Podcast", [0, -1, 2, 1, 0]),
+    ("Late Night", "夜間小聲", [-3, -1, 1, 0, -1]),
     ("Bass Boost", "加強低音", [4, 2, 0, 0, 0]),
-    ("Vocal", "人聲", [-2, -1, 2, 2, 0]),
     ("Bright", "明亮", [0, 0, 0, 2, 3]),
-    ("Late Night", "夜間小聲", [-4, -2, 1, 0, -2]),
 ]
 struct EqPreset: Codable, Equatable { var name: String; var gains: [Int] }
 let alignRestoreFile = wantFile.deletingLastPathComponent().appendingPathComponent("align-restore")
