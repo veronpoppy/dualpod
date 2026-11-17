@@ -30,6 +30,7 @@ func defaultOutput() -> AudioObjectID {
     AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
     return id
 }
+var macSetAt = 0.0
 var macVolume: Float {
     get {
         var v = Float32(0), size = UInt32(MemoryLayout<Float32>.size)
@@ -38,6 +39,7 @@ var macVolume: Float {
     }
     set {
         var v = Float32(newValue)
+        macSetAt = CFAbsoluteTimeGetCurrent()  // our own change: the volume listener must not treat it as a key press
         AudioObjectSetPropertyData(defaultOutput(), &macVolumeAddress, 0, nil, UInt32(MemoryLayout<Float32>.size), &v)
     }
 }
@@ -169,6 +171,15 @@ final class App: NSObject, NSApplicationDelegate {
     var masterBase: [String: Double]?  // device → volume as a share of the loudest, while the master moves
     // Left/right link: moving one HomePod of the pair moves the other by the same amount
     let linkItem = NSMenuItem(title: "", action: #selector(toggleLink), keyEquivalent: "")
+    // Volume keys: the Mac rows follow them live; with this on, the HomePods move by the same amount too
+    let keysItem = NSMenuItem(title: "", action: #selector(toggleKeys), keyEquivalent: "")
+    var keysControlAll: Bool {
+        get { UserDefaults.standard.object(forKey: "keysControlAll") as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: "keysControlAll") }
+    }
+    var lastMac: Float = macVolume
+    var watchedOutput = AudioObjectID(0)
+    lazy var volumeListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.macVolumeChanged() }
     var linkPair: Bool {
         get { UserDefaults.standard.object(forKey: "linkPair") as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: "linkPair") }
@@ -201,6 +212,9 @@ final class App: NSObject, NSApplicationDelegate {
         syncRows()
         linkItem.target = self
         menu.addItem(linkItem)
+        keysItem.target = self
+        menu.addItem(keysItem)
+        watchMacVolume()
         menu.delegate = self
         menu.addItem(.separator())
         lastLine.isEnabled = false
@@ -359,6 +373,9 @@ final class App: NSObject, NSApplicationDelegate {
         linkItem.isHidden = pair.count != 2
         linkItem.title = t("Link Left and Right Volume", "左右聲道音量連動")
         linkItem.state = linkPair ? .on : .off
+        keysItem.isHidden = pair.isEmpty
+        keysItem.title = t("Volume Keys Control All Speakers", "鍵盤音量鍵控制全部喇叭")
+        keysItem.state = keysControlAll ? .on : .off
         settingsItem.title = t("Settings…", "設定…")
         let playing = actual.filter { $0 != "Mac" }.sorted()
         if settings.playing != playing { settings.playing = playing }
@@ -494,6 +511,50 @@ final class App: NSObject, NSApplicationDelegate {
             rows[d]?.slider.doubleValue = v
         }
         writeVolumes()
+    }
+
+    @objc func toggleKeys() {
+        keysControlAll.toggle()
+        render(lastStatus)
+    }
+
+    /// Follow the system volume: the default output can change (headphones plugged in), so re-attach to it then.
+    func watchMacVolume() {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { [weak self] _, _ in
+            self?.attachVolumeListener()
+        }
+        attachVolumeListener()
+    }
+    func attachVolumeListener() {
+        if watchedOutput != 0 {
+            AudioObjectRemovePropertyListenerBlock(watchedOutput, &macVolumeAddress, .main, volumeListener)
+        }
+        watchedOutput = defaultOutput()
+        AudioObjectAddPropertyListenerBlock(watchedOutput, &macVolumeAddress, .main, volumeListener)
+        lastMac = macVolume
+        macVolumeChanged()
+    }
+
+    /// The system volume changed. Our own sliders and auto-align set it too; those only update the rows.
+    func macVolumeChanged() {
+        let now = macVolume
+        let delta = Int(((now - lastMac) * 100).rounded())
+        lastMac = now
+        rows["Mac"]?.slider.doubleValue = Double(now)
+        let fromKeys = CFAbsoluteTimeGetCurrent() - macSetAt > 0.5 && !settings.aligning
+        if fromKeys, keysControlAll, delta != 0 {
+            let pair = playingPair()
+            for d in pair {
+                let v = min(100, max(0, (homeVolume[d] ?? 35) + delta))
+                homeVolume[d] = v
+                rows[d]?.slider.doubleValue = Double(v) / 100
+            }
+            if !pair.isEmpty { writeVolumes() }
+        }
+        if masterBase == nil || fromKeys { masterBase = nil; masterRow.slider.doubleValue = masterLevel() }
     }
 
     @objc func toggleLink() {
