@@ -4,8 +4,15 @@
 #   2. 重新抓相依元件、編譯
 #   3. 結束執行中的 DualPod，換掉 /Applications/DualPod.app 再打開
 # 用法：zsh scripts/update-mine.sh（第一次安裝也是跑這支）
+#       zsh scripts/update-mine.sh --zip <資料夾>：只編譯，把 DualPod-mine-<官方版本>.zip 放到那個資料夾，不動這台的 App
+#       （在別台 Mac 編譯、例如放進 iCloud Drive 給筆電裝）
 # 打開後選單若出現「更新背景服務…」，點它並輸入 Mac 密碼，背景服務才會換成新版。
 set -eu
+ZIPDIR=
+if [[ ${1:-} == --zip ]]; then
+  [[ -d ${2:-} ]] || { echo "用法：zsh scripts/update-mine.sh --zip <已存在的資料夾>"; exit 1; }
+  ZIPDIR=${2:A}
+fi
 ROOT=${0:A:h:h}
 cd $ROOT
 UPSTREAM=https://github.com/NightLightTw/dualpod.git
@@ -30,6 +37,14 @@ fi
 rm -rf airplay-cli audiotee
 zsh scripts/fetch-deps.sh
 zsh app/build.sh
+
+if [[ -n $ZIPDIR ]]; then
+  out=$ZIPDIR/DualPod-mine-${tag#v}.zip
+  rm -f $out
+  ditto -c -k --keepParent app/DualPod.app $out
+  echo "完成：$out（官方 $tag ＋ 自己的修改）"
+  exit 0
+fi
 
 osascript -e 'tell application id "local.airplay-stereo.menu" to quit' 2>/dev/null || pkill -x StereoMenu 2>/dev/null || true
 sleep 1
