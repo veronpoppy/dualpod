@@ -21,6 +21,7 @@ let eqPresets: [(en: String, zh: String, gains: [Int])] = [
     ("Bright", "明亮", [0, 0, 0, 2, 3]),
     ("Late Night", "夜間小聲", [-4, -2, 1, 0, -2]),
 ]
+struct EqPreset: Codable, Equatable { var name: String; var gains: [Int] }
 let alignRestoreFile = wantFile.deletingLastPathComponent().appendingPathComponent("align-restore")
 
 func readSetting(_ url: URL) -> String {
@@ -101,14 +102,72 @@ final class SettingsModel: ObservableObject {
     var onUpdateChange: () -> Void = {}
     /// "off", "preset:<name>" or "custom:#RRGGBB"; the service reads it when playback starts and when it changes
     @Published private(set) var eq = parseEq(readSetting(eqFile))
+    /// What the preset menu shows: "b:<index>" a built-in, "u:<name>" one the user saved, "custom" the last hand-set values.
+    /// Only `eq` goes to the service; the rest is the app's own bookkeeping in UserDefaults.
+    @Published private(set) var eqSelection = UserDefaults.standard.string(forKey: "eqSelection") ?? ""
+    @Published private(set) var userEqPresets: [EqPreset] = {
+        guard let d = UserDefaults.standard.data(forKey: "eqUserPresets"),
+              let list = try? JSONDecoder().decode([EqPreset].self, from: d) else { return [] }
+        return list.filter { $0.gains.count == 5 }
+    }()
+    /// The hand-set values stay here while another preset plays, so picking Custom brings them back
+    @Published private(set) var customEq = parseEq(UserDefaults.standard.string(forKey: "eqCustom") ?? "")
+
+    /// A slider moved: whatever was picked, this is now Custom (a saved preset changes only when saved again)
     func setEq(_ band: Int, _ db: Int) {
         var g = eq
         g[band] = max(-12, min(12, db))
-        setEq(g)
+        guard writeEq(g) else { return }
+        customEq = g
+        UserDefaults.standard.set(g.map(String.init).joined(separator: " "), forKey: "eqCustom")
+        selectEq("custom", apply: false)
     }
-    func setEq(_ g: [Int]) {
-        guard g != eq else { return }
-        if writeSetting(eqFile, g.map(String.init).joined(separator: " ")) { eq = g }
+    @discardableResult
+    private func writeEq(_ g: [Int]) -> Bool {
+        guard g != eq else { return true }
+        if writeSetting(eqFile, g.map(String.init).joined(separator: " ")) { eq = g; return true }
+        return false
+    }
+    func eqGains(_ tag: String) -> [Int]? {
+        if tag == "custom" { return customEq }
+        if tag.hasPrefix("b:"), let i = Int(tag.dropFirst(2)), eqPresets.indices.contains(i) { return eqPresets[i].gains }
+        if tag.hasPrefix("u:") { return userEqPresets.first { "u:" + $0.name == tag }?.gains }
+        return nil
+    }
+    func selectEq(_ tag: String, apply: Bool = true) {
+        guard let g = eqGains(tag) else { return }
+        if apply, !writeEq(g) { return }
+        eqSelection = tag
+        UserDefaults.standard.set(tag, forKey: "eqSelection")
+    }
+    /// Same name again overwrites that preset
+    func saveEqPreset(_ rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        if let i = userEqPresets.firstIndex(where: { $0.name == name }) { userEqPresets[i].gains = eq }
+        else { userEqPresets.append(EqPreset(name: name, gains: eq)) }
+        storeUserPresets()
+        selectEq("u:" + name, apply: false)
+    }
+    func deleteEqPreset(_ name: String) {
+        userEqPresets.removeAll { $0.name == name }
+        storeUserPresets()
+        if eqSelection == "u:" + name {  // the sound doesn't change; it just has no name any more
+            customEq = eq
+            UserDefaults.standard.set(eq.map(String.init).joined(separator: " "), forKey: "eqCustom")
+            selectEq("custom", apply: false)
+        }
+    }
+    private func storeUserPresets() {
+        if let d = try? JSONEncoder().encode(userEqPresets) { UserDefaults.standard.set(d, forKey: "eqUserPresets") }
+    }
+    /// First run, or the picked preset is gone: name what's playing now
+    private func settleEqSelection() {
+        if eqGains(eqSelection) == eq { return }
+        if let i = eqPresets.firstIndex(where: { $0.gains == eq }) { selectEq("b:\(i)", apply: false); return }
+        customEq = eq
+        UserDefaults.standard.set(eq.map(String.init).joined(separator: " "), forKey: "eqCustom")
+        selectEq("custom", apply: false)
     }
     @Published private(set) var glow = parseGlow(readGlowFile())
     /// Saves first and updates the UI only if that worked, so a failed write leaves the old state and picking again retries
@@ -122,7 +181,10 @@ final class SettingsModel: ObservableObject {
         glow = parseGlow(readGlowFile())
         if glow.hasPrefix("custom:#") { lastCustom = glow }
     }
-    init() { if glow.hasPrefix("custom:#") { lastCustom = glow } }
+    init() {
+        if glow.hasPrefix("custom:#") { lastCustom = glow }
+        settleEqSelection()
+    }
     private var glowBeforeOff = "preset:warm"
     var glowOn: Bool { glow != "off" }
     func setGlowOn(_ on: Bool) {
@@ -203,6 +265,8 @@ final class ChannelTest {
 /// The two Settings panes. Audio is what people come for; General holds the rarely touched upkeep.
 struct AudioPane: View {
     @ObservedObject var model: SettingsModel
+    @State private var askingName = false
+    @State private var presetName = ""
     let playChannel: (_ right: Bool) -> Void
     let autoAlign: () -> Void
     let installHelper: () -> Void
@@ -295,13 +359,33 @@ struct AudioPane: View {
                 eqBand(3, t("High Mid", "中高"), "4 kHz")
                 eqBand(4, t("Treble", "高音"), "12 kHz")
                 LabeledContent(t("Preset", "預設")) {
-                    Picker(t("Preset", "預設"), selection: Binding(
-                        get: { eqPresets.firstIndex { $0.gains == model.eq } ?? -1 },
-                        set: { if eqPresets.indices.contains($0) { model.setEq(eqPresets[$0].gains) } })) {
-                        if !eqPresets.contains(where: { $0.gains == model.eq }) { Text(t("Custom", "自訂")).tag(-1) }
-                        ForEach(eqPresets.indices, id: \.self) { Text(t(eqPresets[$0].en, eqPresets[$0].zh)).tag($0) }
+                    HStack(spacing: 8) {
+                        if model.eqSelection.hasPrefix("u:") {
+                            Button(t("Delete", "刪除")) { model.deleteEqPreset(String(model.eqSelection.dropFirst(2))) }
+                        }
+                        Button(t("Save…", "儲存…")) {
+                            presetName = model.eqSelection.hasPrefix("u:") ? String(model.eqSelection.dropFirst(2)) : ""
+                            askingName = true
+                        }
+                        Picker(t("Preset", "預設"), selection: Binding(get: { model.eqSelection }, set: { model.selectEq($0) })) {
+                            ForEach(eqPresets.indices, id: \.self) { Text(t(eqPresets[$0].en, eqPresets[$0].zh)).tag("b:\($0)") }
+                            if !model.userEqPresets.isEmpty {
+                                Divider()
+                                ForEach(model.userEqPresets, id: \.name) { Text($0.name).tag("u:" + $0.name) }
+                            }
+                            Divider()
+                            Text(t("Custom", "自訂")).tag("custom")
+                        }
+                        .labelsHidden().fixedSize()
                     }
-                    .labelsHidden().fixedSize()
+                }
+                .alert(t("Save Equalizer Preset", "儲存等化器設定"), isPresented: $askingName) {
+                    TextField(t("Name", "名稱"), text: $presetName)
+                    Button(t("Save", "儲存")) { model.saveEqPreset(presetName) }
+                        .disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button(t("Cancel", "取消"), role: .cancel) {}
+                } message: {
+                    Text(t("Using the name of a saved preset replaces it.", "用已經存過的名稱會覆蓋那一組。"))
                 }
             } header: {
                 Text(t("Equalizer", "等化器"))
