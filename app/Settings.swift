@@ -103,6 +103,13 @@ final class SettingsModel: ObservableObject {
     @Published var foundTag: String? { didSet { onUpdateChange() } }  // newest release seen; stays while checking again
     var onUpdateChange: () -> Void = {}
     /// "off", "preset:<name>" or "custom:#RRGGBB"; the service reads it when playback starts and when it changes
+    // Menu switches (UserDefaults): moving one HomePod of the pair moves the other; volume keys move every speaker
+    @Published var linkPair = UserDefaults.standard.object(forKey: "linkPair") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(linkPair, forKey: "linkPair") }
+    }
+    @Published var keysControlAll = UserDefaults.standard.object(forKey: "keysControlAll") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(keysControlAll, forKey: "keysControlAll") }
+    }
     @Published private(set) var eq = parseEq(readSetting(eqFile))
     /// What the preset menu shows: "b:<index>" a built-in, "u:<name>" one the user saved, "custom" the last hand-set values.
     /// Only `eq` goes to the service; the rest is the app's own bookkeeping in UserDefaults.
@@ -267,8 +274,6 @@ final class ChannelTest {
 /// The two Settings panes. Audio is what people come for; General holds the rarely touched upkeep.
 struct AudioPane: View {
     @ObservedObject var model: SettingsModel
-    @State private var askingName = false
-    @State private var presetName = ""
     let playChannel: (_ right: Bool) -> Void
     let autoAlign: () -> Void
     let installHelper: () -> Void
@@ -354,67 +359,10 @@ struct AudioPane: View {
                      : t("The Mac plays \(model.sync) ms later than the HomePods.", "Mac 比 HomePod 晚 \(model.sync) ms 播。"))
                     .foregroundStyle(.secondary)
             }
-            Section {
-                eqBand(0, t("Bass", "低音"), "80 Hz")
-                eqBand(1, t("Low Mid", "中低"), "250 Hz")
-                eqBand(2, t("Mid", "中音"), "1 kHz")
-                eqBand(3, t("High Mid", "中高"), "4 kHz")
-                eqBand(4, t("Treble", "高音"), "12 kHz")
-                LabeledContent(t("Preset", "預設")) {
-                    HStack(spacing: 8) {
-                        if model.eqSelection.hasPrefix("u:") {
-                            Button(t("Delete", "刪除")) { model.deleteEqPreset(String(model.eqSelection.dropFirst(2))) }
-                        }
-                        Button(t("Save…", "儲存…")) {
-                            presetName = model.eqSelection.hasPrefix("u:") ? String(model.eqSelection.dropFirst(2)) : ""
-                            askingName = true
-                        }
-                        Picker(t("Preset", "預設"), selection: Binding(get: { model.eqSelection }, set: { model.selectEq($0) })) {
-                            ForEach(eqPresets.indices, id: \.self) { Text(t(eqPresets[$0].en, eqPresets[$0].zh)).tag("b:\($0)") }
-                            if !model.userEqPresets.isEmpty {
-                                Divider()
-                                ForEach(model.userEqPresets, id: \.name) { Text($0.name).tag("u:" + $0.name) }
-                            }
-                            Divider()
-                            Text(t("Custom", "自訂")).tag("custom")
-                        }
-                        .labelsHidden().fixedSize()
-                    }
-                }
-                .alert(t("Save Equalizer Preset", "儲存等化器設定"), isPresented: $askingName) {
-                    TextField(t("Name", "名稱"), text: $presetName)
-                    Button(t("Save", "儲存")) { model.saveEqPreset(presetName) }
-                        .disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
-                    Button(t("Cancel", "取消"), role: .cancel) {}
-                } message: {
-                    Text(t("Using the name of a saved preset replaces it.", "用已經存過的名稱會覆蓋那一組。"))
-                }
-            } header: {
-                Text(t("Equalizer", "等化器"))
-            } footer: {
-                Text(t("Applies to every speaker, including this Mac, within a moment. Raising a band lowers everything a little so loud songs don't distort.",
-                       "套用到所有喇叭（含這台 Mac），調了馬上生效。調高任一段時整體會小聲一點，避免爆音。"))
-                    .foregroundStyle(.secondary)
-            }
         }
         .formStyle(.grouped)
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private func eqBand(_ band: Int, _ name: String, _ freq: String) -> some View {
-        LabeledContent {
-            HStack(spacing: 8) {
-                Slider(value: Binding(get: { Double(model.eq[band]) }, set: { model.setEq(band, Int($0.rounded())) }),
-                       in: -12...12, step: 1)
-                    .frame(width: 200)
-                Text(model.eq[band] > 0 ? "+\(model.eq[band]) dB" : "\(model.eq[band]) dB")
-                    .monospacedDigit().foregroundStyle(.secondary).frame(width: 50, alignment: .trailing)
-            }
-        } label: {
-            Text(name)
-            Text(freq)
-        }
     }
 
     /// Like the Home app's stereo pair screen: the left speaker on the left, the right one on the right.

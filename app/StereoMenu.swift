@@ -5,6 +5,7 @@
 import AppKit
 import AVFoundation
 import SwiftUI
+import Combine
 import CoreAudio
 import AudioToolbox  // VirtualMainVolume 定義在這裡
 
@@ -171,21 +172,16 @@ final class App: NSObject, NSApplicationDelegate {
     let masterItem = NSMenuItem()
     var masterRow: DeviceRow!
     var masterBase: [String: Double]?  // device → volume as a share of the loudest, while the master moves
-    // Left/right link: moving one HomePod of the pair moves the other by the same amount
-    let linkItem = NSMenuItem(title: "", action: #selector(toggleLink), keyEquivalent: "")
-    // Volume keys: the Mac rows follow them live; with this on, the HomePods move by the same amount too
-    let keysItem = NSMenuItem(title: "", action: #selector(toggleKeys), keyEquivalent: "")
-    var keysControlAll: Bool {
-        get { UserDefaults.standard.object(forKey: "keysControlAll") as? Bool ?? false }
-        set { UserDefaults.standard.set(newValue, forKey: "keysControlAll") }
-    }
+    // Switch rows and the equalizer are SwiftUI views in the menu: clicking them keeps the menu open
+    lazy var linkItem = HostedMenuItem(LinkRow(model: settings))
+    lazy var keysItem = HostedMenuItem(KeysRow(model: settings))
+    lazy var eqItem = HostedMenuItem(EqMenuView(model: settings, save: { [weak self] in self?.askPresetName() }))
+    var keysControlAll: Bool { settings.keysControlAll }
     var lastMac: Float = macVolume
     var watchedOutput = AudioObjectID(0)
     lazy var volumeListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.macVolumeChanged() }
-    var linkPair: Bool {
-        get { UserDefaults.standard.object(forKey: "linkPair") as? Bool ?? false }
-        set { UserDefaults.standard.set(newValue, forKey: "linkPair") }
-    }
+    var linkPair: Bool { settings.linkPair }
+    var presetObserver: Any?
     let settingsItem = NSMenuItem(title: "", action: #selector(openSettings), keyEquivalent: ",")
     let updateItem = NSMenuItem(title: "", action: #selector(openUpdatePage), keyEquivalent: "")
     let settings = SettingsModel()
@@ -212,10 +208,14 @@ final class App: NSObject, NSApplicationDelegate {
         masterItem.view = masterRow
         menu.addItem(masterItem)
         syncRows()
-        linkItem.target = self
         menu.addItem(linkItem)
-        keysItem.target = self
         menu.addItem(keysItem)
+        menu.addItem(.separator())
+        menu.addItem(eqItem)
+        // a saved or deleted preset adds or removes a chip, which can change the panel's height
+        presetObserver = settings.$userEqPresets.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.eqItem.fit() }
+        }
         watchMacVolume()
         menu.delegate = self
         menu.addItem(.separator())
@@ -384,11 +384,7 @@ final class App: NSObject, NSApplicationDelegate {
         masterRow.enabled = !missing
         if masterBase == nil { masterRow.slider.doubleValue = masterLevel() }
         linkItem.isHidden = pair.count != 2
-        linkItem.title = t("Link Left and Right Volume", "左右聲道音量連動")
-        linkItem.state = linkPair ? .on : .off
         keysItem.isHidden = pair.isEmpty
-        keysItem.title = t("Volume Keys Control All Speakers", "鍵盤音量鍵控制全部喇叭")
-        keysItem.state = keysControlAll ? .on : .off
         settingsItem.title = t("Settings…", "設定…")
         let playing = actual.filter { $0 != "Mac" }.sorted()
         if settings.playing != playing { settings.playing = playing }
@@ -536,9 +532,23 @@ final class App: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    @objc func toggleKeys() {
-        keysControlAll.toggle()
-        render(lastStatus)
+    /// Typing needs a window: close the menu first, then ask for the preset's name
+    func askPresetName() {
+        menu.cancelTracking()
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = t("Save Equalizer Preset", "儲存等化器設定")
+            alert.informativeText = t("Using the name of a saved preset replaces it.", "用已經存過的名稱會覆蓋那一組。")
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+            field.placeholderString = t("Name", "名稱")
+            if self.settings.eqSelection.hasPrefix("u:") { field.stringValue = String(self.settings.eqSelection.dropFirst(2)) }
+            alert.accessoryView = field
+            alert.addButton(withTitle: t("Save", "儲存"))
+            alert.addButton(withTitle: t("Cancel", "取消"))
+            alert.window.initialFirstResponder = field
+            if alert.runModal() == .alertFirstButtonReturn { self.settings.saveEqPreset(field.stringValue) }
+        }
     }
 
     /// Follow the system volume: the default output can change (headphones plugged in), so re-attach to it then.
@@ -580,10 +590,6 @@ final class App: NSObject, NSApplicationDelegate {
         if masterBase == nil || fromKeys { masterBase = nil; masterRow.slider.doubleValue = masterLevel() }
     }
 
-    @objc func toggleLink() {
-        linkPair.toggle()
-        render(lastStatus)
-    }
 
     let aligner = AutoAlign()
 

@@ -44,7 +44,7 @@ else
 fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-swiftc -O -target $TARGET StereoMenu.swift Settings.swift Align.swift Update.swift -o "$APP/Contents/MacOS/StereoMenu"
+swiftc -O -target $TARGET StereoMenu.swift Settings.swift EqMenu.swift Align.swift Update.swift -o "$APP/Contents/MacOS/StereoMenu"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
