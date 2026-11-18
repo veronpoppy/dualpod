@@ -116,6 +116,31 @@ reread_devices() {
   true
 }
 
+# 喇叭被別的裝置（iPhone、別台 Mac）接走了嗎：HomePod 廣播的 gid 在別人播放時是「<tsid>+1+<對方的群組 UUID>」，
+# DualPod 自己播時只有「<tsid>+1」，閒置時等於 pgid（HomePod mini 27.2 實測）。查不到名稱或 TXT 就當沒被接走，照舊重連
+taken_by_other() {  # 喇叭 ID
+  local name gid
+  name=$(awk -F'\t' -v k=$1 '$1 == k { print $3; exit }' $SPEAKERS 2>/dev/null)
+  [[ -n $name ]] || return 1
+  gid=$( (dns-sd -L "$name" _airplay._tcp local & p=$!; sleep 1.5; kill $p) 2>/dev/null |
+    grep -m1 'deviceid=' | sed -n 's/.* gid=\([^ ]*\).*/\1/p')
+  [[ $gid == *+*+?* ]]
+}
+# HomePod 主動關掉連線（event channel closed by receiver）時才查：一般網路卡頓不會有這行，不必多等。
+# HomePod 更新廣播要一點時間，最多查三輪（約 6 秒）。印出被接走的喇叭 ID，沒有就印空字串
+taken_speakers() {  # stamp
+  local d i
+  local -a hp=() logs=() taken=()
+  for d in ${=DEVICES}; do [[ $d != Mac ]] && hp+=$d logs+=$LOGDIR/pair-$1-$d.log; done
+  grep -q 'event channel closed by receiver' $logs 2>/dev/null || return 0
+  for i in 1 2 3; do
+    sleep 0.5
+    for d in $hp; do taken_by_other $d && taken+=$d; done
+    (( $#taken )) && break
+  done
+  print -r -- ${(u)taken}
+}
+
 supervise() {
   trap '' HUP
   say "supervisor pid $$ as $(whoami)"
@@ -145,10 +170,17 @@ supervise() {
       [[ -n $reason ]] && break
     done
     [[ -z $reason ]] && reason="run_pair_exited: run_pair exited"
-    say "restart: $reason"
+    # 被別的裝置接走：讓位，不搶回來（否則兩邊會互相搶到 DualPod 放棄）。App 看到 yield 會顯示「點這裡搶回來」
+    local taken=""
+    [[ -z ${TEST:-} ]] && taken=$(taken_speakers $stamp)
+    [[ -n $taken ]] && say "yield: taken by another device: $taken" || say "restart: $reason"
     kill -TERM $child 2>/dev/null
     for t in {1..30}; do kill -0 $child 2>/dev/null || break; sleep 0.1; done  # run_pair 卡住不收尾時不能永遠等
     kill -9 $child 2>/dev/null; wait $child 2>/dev/null; stop_all
+    if [[ -n $taken ]]; then
+      summarize $stamp taken_by_other $began_at
+      rm -f $PIDFILE; exit 0
+    fi
     summarize $stamp ${reason%%:*} $began_at
     summarized=$stamp
     now=$(date +%s); restarts+=($now); recent=0

@@ -162,6 +162,8 @@ final class App: NSObject, NSApplicationDelegate {
     var header = NSMenuItem.sectionHeader(title: "")
     let warning = NSMenuItem()
     let lastLine = NSMenuItem()
+    // The service stepped aside because another device (an iPhone, another Mac) took the speakers over
+    let takenItem = NSMenuItem(title: "", action: #selector(reclaim), keyEquivalent: "")
     var rows: [String: DeviceRow] = [:]
     var homeVolume: [String: Int] = [:]  // speaker id → 0…100; 35 until set
     // "All" row: one slider for every output that is playing. It scales them together and keeps their balance:
@@ -219,6 +221,8 @@ final class App: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         lastLine.isEnabled = false
         menu.addItem(lastLine)
+        takenItem.target = self
+        menu.addItem(takenItem)
         settingsItem.target = self
         menu.addItem(settingsItem)
         menu.addItem(quit)
@@ -357,6 +361,15 @@ final class App: NSObject, NSApplicationDelegate {
         let last = lines.dropFirst().first ?? ""
         lastLine.title = t("Last event: ", "上次事件：") + last.dropFirst(11)
         lastLine.isHidden = !(last.contains("restart:") || last.contains("gave up"))
+        // "yield: taken by another device: <id> <id>" stays the last line until the next start
+        let taken = last.contains("yield:") && !streaming
+        takenItem.isHidden = !taken
+        if taken {
+            let ids = last.components(separatedBy: "device:").last?.split(separator: " ").map(String.init) ?? []
+            let names = ids.compactMap { id in speakers.first { $0.id == id }?.name }
+            takenItem.title = t("\(names.isEmpty ? "The speakers" : names.joined(separator: ", ")) went to another device. Take Them Back",
+                                "\(names.isEmpty ? "喇叭" : names.joined(separator: "、"))被其他裝置接走了，點這裡搶回來")
+        }
         if let tag = settings.foundTag {
             let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
             updateItem.title = t("DualPod \(v) Is Available…", "有新版本：DualPod \(v)…")
@@ -511,6 +524,16 @@ final class App: NSObject, NSApplicationDelegate {
             rows[d]?.slider.doubleValue = v
         }
         writeVolumes()
+    }
+
+    /// Write the same choice again: the service starts when the file changes and it isn't playing that set
+    @objc func reclaim() {
+        guard let text = try? String(contentsOf: wantFile, encoding: .utf8), !text.isEmpty else { return }
+        try? text.write(to: wantFile, atomically: true, encoding: .utf8)  // atomic write = new inode, the service sees it
+        let want = Set(text.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init))
+        pending = (want, Date().addingTimeInterval(20))
+        render(lastStatus)
+        refresh()
     }
 
     @objc func toggleKeys() {
