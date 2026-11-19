@@ -11,12 +11,15 @@ DualPod is licensed under the GNU General Public License, version 3 (see [LICENS
 - Patches:
   - `patches/airplay-cli/0001-upstream-pr100-homepod-mini-2-ptp.diff` is the change proposed upstream in music-assistant/airplay-cli pull request #100 by Jonathan Delgado. It fixes the HomePod mini (2nd generation) staying silent.
   - `patches/airplay-cli/0002-bind-ptp-to-interface-on-macos.diff` binds PTP ports 319/320 to the chosen interface address, because macOS's own gPTP holds the wildcard sockets.
+  - `patches/airplay-cli/0003-log-retransmit-requests.diff` logs, every 5 seconds and when a stream stops, how many lost packets the speaker asked to have resent, and how long after a packet was sent the request for it arrived. DualPod uses it to tell whether a smaller buffer leaves too little time to recover lost packets.
 
 ## audiotee
 
 - Source: https://github.com/makeusabrew/audiotee, commit `56ac954369a09318e46b88a6eec33c2d2b0d32a3`
 - License: MIT
-- Patch: `patches/audiotee/0001-converter-supply-input-once.diff` hands each input chunk to the sample-rate converter once. The unpatched converter replayed the chunk when asked for more input, which added an audible hiss to music.
+- Patches:
+  - `patches/audiotee/0001-converter-supply-input-once.diff` hands each input chunk to the sample-rate converter once. The unpatched converter replayed the chunk when asked for more input, which added an audible hiss to music.
+  - `patches/audiotee/0002-log-chunk-age.diff` logs, every 10 seconds, how old the last captured sample is when each capture callback writes its last chunk out (not counting the resampler). DualPod uses it to measure latency.
 
 ```
 The MIT License

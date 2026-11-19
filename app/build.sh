@@ -20,8 +20,9 @@ if [[ ${1:-} == dist ]]; then
     patches=(${PWD:h}/patches/$dep/*.diff(N))
     if (( $#patches )); then
       git -C ../$dep apply --reverse --check $patches || die "$dep 沒有套上 patches/$dep"
-      # 改動的檔案與行數要和 patches 完全一樣：多改一行都會被發現
-      [[ $(git -C ../$dep diff HEAD --numstat | sort) == $(git -C ../$dep apply --numstat $patches | sort) ]] ||
+      # 改動的檔案與行數要和 patches 完全一樣：多改一行都會被發現。好幾份 patch 改同一個檔案時，按檔案加總再比
+      [[ $(git -C ../$dep diff HEAD --numstat | sort) == $(git -C ../$dep apply --numstat $patches |
+            awk -F'\t' '{a[$3] += $1; d[$3] += $2} END {for (f in a) print a[f] "\t" d[f] "\t" f}' | sort) ]] ||
         die "$dep 除了 patches 還有別的修改"
     else
       [[ -z $(git -C ../$dep diff HEAD) ]] || die "$dep 有修改"

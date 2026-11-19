@@ -33,12 +33,16 @@ pr.kill()
 def body(b):
     a = array.array("h", b[: len(b) // 2 * 2]); i = 0
     while i < len(a) and a[i] == 0: i += 1
-    return list(a[i: i + len(src)])
-L, R = list(src[0::2]), list(src[1::2])
+    return list(a[i:])
+# 起播時若 split 還沒讀、已經積了好幾塊，會當成積壓只留最新一塊，所以內容可以從後面某一塊的開頭開始；之後要原樣連續到結尾
+k1 = abs(body(got[2])[0])  # LR 輸出的第一個樣本編號
+assert (k1 - 1) % 882 == 0 and k1 - 1 < n, f"開頭只能少整數塊、而且不能全丟（從第 {k1} 個 frame 開始）"
+L, R = list(src[0::2])[k1 - 1:], list(src[1::2])[k1 - 1:]
 dup = lambda x: [v for v in x for _ in (0, 1)]
-assert body(got[0]) == dup(L), "L"
-assert body(got[1]) == dup(R), "R"
-assert body(got[2]) == list(src), "LR"
+want = list(src)[(k1 - 1) * 2:]  # 結尾之後 split 會補靜音，只比到來源結束
+assert body(got[0])[:len(want)] == dup(L), "L"
+assert body(got[1])[:len(want)] == dup(R), "R"
+assert body(got[2])[:len(want)] == want, "LR"
 print("split self-test ok")
 
 
@@ -209,3 +213,71 @@ pr.kill()
 assert open(routes + ".active").read() == second, "沒有 @ 的新檔套用後 .active 就是它，不是被取代的舊檔"
 assert not frames("b2"), "被取代的排程不能執行"
 print("split replaced-schedule self-test ok")
+
+
+# (5) 延遲固定：輸入晚到（啟動慢 60 ms）或斷流後恢復，那批輸入都要排在「收到時刻 + (T − t0)」播出，
+# 也就是 run_pair 設的 TARGET，不能被晚到的時間吃掉
+names = ["a"]
+fp = {"a": f"{d}/ld-a"}
+if os.path.exists(fp["a"]): os.remove(fp["a"])
+os.mkfifo(fp["a"])
+holders = [os.open(fp["a"], os.O_RDWR)]
+T = int(time.time() * 1000) + 200
+pr = subprocess.Popen([split, "split", "--start-ms", str(T), f"{fp['a']}:LR"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+t0 = float(pr.stderr.readline().decode().split("t0_unix=")[1]) * 1000
+chunks = {"a": []}
+stop = {"a": False}
+threads = [threading.Thread(target=rd, args=("a",), daemon=True)]
+for t in threads: t.start()
+time.sleep(0.06)
+k0 = 0
+t_first = time.time() * 1000
+feed(1.0)
+time.sleep(0.15)
+k_resume, t_resume = k0, time.time() * 1000
+feed(0.5)
+time.sleep(0.2)
+stop["a"] = True
+for t in threads: t.join()
+pr.kill()
+fa = frames("a")
+z1 = next(i for i, (l, _) in enumerate(fa) if l != 0)
+z2 = next(i for i, (l, _) in enumerate(fa) if l == k_resume % W + 1 and i >= z1 + k_resume)  # 編號每 W 個繞回，從第一段之後找
+want = T - t0
+lead1, lead2 = T + z1 / 44.1 - t_first, T + z2 / 44.1 - t_resume
+assert abs(lead1 - want) < 20, f"晚 60 ms 才來的第一批輸入，延遲要是 {want:.0f} ms，實際 {lead1:.0f}"
+assert abs(lead2 - want) < 20, f"斷流 150 ms 後恢復，延遲要是 {want:.0f} ms，實際 {lead2:.0f}"
+print(f"split fixed-latency self-test ok (want {want:.0f} ms, start {lead1:.0f}, after stall {lead2:.0f})")
+
+
+# (6) 起播時 tap 已經積了一批（50 ms）：只留最新的 20 ms（一塊的長度），延遲才不會被那批舊樣本拉長
+names = ["a"]
+if os.path.exists(fp["a"]): os.remove(fp["a"])
+os.mkfifo(fp["a"])
+holders = [os.open(fp["a"], os.O_RDWR)]
+T = int(time.time() * 1000) + 200
+pr = subprocess.Popen([split, "split", "--start-ms", str(T), f"{fp['a']}:LR"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+t0 = float(pr.stderr.readline().decode().split("t0_unix=")[1]) * 1000
+chunks = {"a": []}
+stop = {"a": False}
+threads = [threading.Thread(target=rd, args=("a",), daemon=True)]
+for t in threads: t.start()
+time.sleep(0.06)
+k0 = 0
+backlog = array.array("h")
+for k in range(2205): backlog.extend([k % W + 1, -(k % W + 1)])  # 50 ms，一次寫入
+k0 = 2205
+t_first = time.time() * 1000
+pr.stdin.write(backlog.tobytes()); pr.stdin.flush()
+time.sleep(0.03)  # 讓 split 先讀到這批；feed 的第一塊若同時到，最新 20 ms 會是它而不是這批
+feed(0.5)
+time.sleep(0.2)
+stop["a"] = True
+for t in threads: t.join()
+pr.kill()
+fa = frames("a")
+zn = next(i for i, (l, _) in enumerate(fa) if l == 2205)  # 那批最新的一個樣本
+want = T - t0 + 20
+lead = T + zn / 44.1 - t_first
+assert abs(lead - want) < 10, f"起播時積了 50 ms，最新樣本的延遲要是 {want:.0f} ms，實際 {lead:.0f}"
+print(f"split backlog self-test ok (want {want:.0f} ms, got {lead:.0f})")

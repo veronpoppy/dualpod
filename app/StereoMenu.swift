@@ -338,7 +338,7 @@ final class App: NSObject, NSApplicationDelegate {
         let streaming = shown.contains { $0 != "Mac" }
         item.button?.image = streaming ? Self.iconPlaying : Self.iconIdle
         header.title = pending != nil ? t("Output · switching…", "輸出 · 切換中…")
-            : streaming ? t("Output · ~0.3 s latency", "輸出 · 延遲約 0.3 秒")
+            : streaming ? t("Output · \(readBuffer()) ms buffer", "輸出 · 緩衝 \(readBuffer()) ms")
             : speakers.isEmpty ? t("Output · looking for speakers…", "輸出 · 正在尋找喇叭…") : t("Output", "輸出")
         let helper = helperState(first)
         warning.title = helper == "missing" ? t("Install Background Helper…", "安裝背景服務…")
@@ -435,6 +435,7 @@ final class App: NSObject, NSApplicationDelegate {
             w.center()
         }
         settings.reloadGlow()
+        settings.reloadBuffer()
         NSApp.activate(ignoringOtherApps: true)  // menu bar apps aren't active, so the window would open behind
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
@@ -645,11 +646,11 @@ final class App: NSObject, NSApplicationDelegate {
             else { try? line.write(to: url, atomically: true, encoding: .utf8) }
         }
         let changed = t("The outputs changed. Nothing changed.", "輸出裝置變了，對齊值沒有改。")
-        // Wait for the restart with the probe offset: its "start … mac_sync_ms=<probe> (log tag X)" line, then its split log
+        // Wait for the restart with the probe offset: its "start … mac_sync_ms=<probe> buffer_ms=… (log tag X)" line, then its split log
         DispatchQueue.global().async {
             var tag: String?, ready = false
             for _ in 0..<90 {
-                if tag == nil, let l = logLines().dropFirst(seen).last(where: { $0.contains("mac_sync_ms=\(probe) (log tag") }) {
+                if tag == nil, let l = logLines().dropFirst(seen).last(where: { $0.contains(" mac_sync_ms=\(probe) ") && $0.contains("(log tag") }) {
                     tag = l.components(separatedBy: "log tag ").last?.trimmingCharacters(in: CharacterSet(charactersIn: ")"))
                 }
                 if let tag, FileManager.default.fileExists(atPath: "\(logDir)/pair-\(tag)-split.log") { ready = true; break }

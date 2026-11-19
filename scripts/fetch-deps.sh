@@ -24,7 +24,10 @@ fetch() {  # 資料夾 網址 commit
   git -C "$dir" fetch --quiet origin "$rev" 2>/dev/null || true
   git -C "$dir" checkout --quiet --detach "$rev"
   git -C "$dir" submodule update --quiet --init --recursive
-  for p in $patches; do git -C "$dir" apply "$p"; echo "$1: applied ${p:t}"; done
+  for p in $patches; do  # 只套上新加的：舊 checkout 已經有前面幾份，重套會失敗
+    if git -C "$dir" apply --reverse --check "$p" 2>/dev/null; then echo "$1: ${p:t} already applied"; continue; fi
+    git -C "$dir" apply "$p"; echo "$1: applied ${p:t}"
+  done
 }
 
 fetch airplay-cli https://github.com/music-assistant/airplay-cli.git 0a58c239d5fb3cf8927b9707a71c6fe897266b6a

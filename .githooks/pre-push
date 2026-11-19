@@ -1,0 +1,16 @@
+#!/bin/zsh
+# 啟用：git config core.hooksPath .githooks。每個要推送的 ref 都跑 scripts/check-private.sh，有個資或 git 出錯就不推
+remote=$1
+zero=0000000000000000000000000000000000000000
+while read local_ref local_sha remote_ref remote_sha; do
+  [[ $local_sha == $zero ]] && continue  # 刪除遠端分支
+  if [[ $remote_sha == $zero ]]; then
+    # 新分支：遠端現在沒有的 commit 都要掃。問遠端本身（本機的 origin/* 可能已過期）；
+    # 遠端有、本機沒有的 commit 不可能是要推的 commit 的祖先，略過即可
+    heads=$(git ls-remote --heads --tags $remote) || { print "pre-push: 讀不到 $remote 的分支，無法確認要推哪些 commit" >&2; exit 1 }
+    range=($local_sha --not ${(f)"$(print -r -- $heads | awk '{print $1}' | git cat-file --batch-check='%(objectname)' 2>/dev/null | grep -v missing)"})
+  else
+    range=($remote_sha..$local_sha)  # remote_sha 不在本機（例如別人推過）時 git 會出錯，檢查會失敗而不是放行
+  fi
+  zsh "$(git rev-parse --show-toplevel)/scripts/check-private.sh" $range || exit 1
+done

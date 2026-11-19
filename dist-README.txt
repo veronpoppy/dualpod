@@ -38,7 +38,7 @@ Settings… is in the DualPod menu in the menu bar, not in System Settings. The 
 - Quit DualPod stops streaming and returns sound to the Mac.
 
 Known limitations
-- The sound reaches the HomePods about 0.3 seconds after the Mac plays it. With music you won't notice. With video, the sound can trail the picture slightly.
+- Sound plays a little later than it would on the Mac alone, by about the buffer you pick in Settings (200 ms by default). When This Mac is also on, its speakers wait too, so all of them stay in time. With music you won't notice. With video, the sound can trail the picture slightly.
 - If the stream keeps failing (for example, Wi-Fi is down), DualPod gives up after more than 5 restarts in 5 minutes. Deselect and reselect a speaker when the network is back.
 - If another device plays to one of the HomePods, the two take turns grabbing it. Stop one of them.
 - With a VPN or several active network interfaces, DualPod may stream from the wrong one and the speakers stay silent. Turn off the VPN, then deselect and reselect a speaker.

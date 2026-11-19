@@ -4,7 +4,7 @@
 //                                           NTP 調整系統時間時兩台不會一台跳、一台慢慢追
 //   stereotool now <offset>                 依上面的時鐘印出現在的 Unix ms
 //   stereotool sleepuntil <unix_ms> <offset>  睡到那個時刻
-//   stereotool split [--routes <檔>] [--start-ms <T>] <路徑:聲道>…   stdin 的 s16le 44.1 kHz 立體聲拆給各輸出：L、R（複製成雙聲道）、LR（原樣）、
+//   stereotool split [--routes <檔>] [--start-ms <T>] [--clock-offset <ns>] <路徑:聲道>…   stdin 的 s16le 44.1 kHz 立體聲拆給各輸出：L、R（複製成雙聲道）、LR（原樣）、
 //                                           0（寫靜音，時間軸照走）、X（關掉 fd，之後不再寫）
 //   split --eq <檔>：五段等化器「80 250 1k 4k 12k Hz」各 -12…12 dB 的整數（例「3 0 0 1 2」；舊的三段「低 中 高」也收），約每 200 ms 看一次有沒有變，變了立刻套用；
 //                                           檔不在或格式不對就不處理（原音）。拆聲道前套用，所以每個輸出聽到的音色一樣、對時不受影響
@@ -26,7 +26,7 @@ import UniformTypeIdentifiers
 
 func rawNs() -> Int64 { Int64(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) }
 func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
-func usage() -> Never { err("用法: stereotool offset | now <offset> | sleepuntil <unix_ms> <offset> | glowart <out.jpg> <RRGGBB>… | split [--routes <檔>] [--start-ms <T>] <路徑:L|R|LR|0|X>…"); exit(2) }
+func usage() -> Never { err("用法: stereotool offset | now <offset> | sleepuntil <unix_ms> <offset> | glowart <out.jpg> <RRGGBB>… | split [--routes <檔>] [--start-ms <T>] [--clock-offset <ns>] <路徑:L|R|LR|0|X>…"); exit(2) }
 
 let args = CommandLine.arguments
 guard args.count >= 2 else { usage() }
@@ -58,7 +58,7 @@ default:
 }
 
 func glowart(out: String, hex: [String]) {
-    guard !out.isEmpty, (1...3).contains(hex.count),
+    guard !out.isEmpty, (1...4).contains(hex.count),
           hex.allSatisfy({ $0.count == 6 && $0.allSatisfy(\.isHexDigit) && $0.allSatisfy(\.isASCII) }) else { usage() }
     let n = 512
     let cs = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -79,16 +79,21 @@ func split(_ argv: [String]) {
     var specs = argv
     var routesFile: String?
     var eqFile: String?
-    var startMs: Int64?
-    while let opt = specs.first, opt == "--routes" || opt == "--start-ms" || opt == "--eq" {
+    var startMs: Int64?, clockOffset: Int64?
+    while let opt = specs.first, ["--routes", "--start-ms", "--clock-offset", "--eq"].contains(opt) {
         guard specs.count >= 2 else { usage() }
-        if opt == "--routes" { routesFile = specs[1] } else if opt == "--eq" { eqFile = specs[1] }
-        else if let t = Int64(specs[1]) { startMs = t } else { usage() }
+        switch opt {
+        case "--routes": routesFile = specs[1]
+        case "--eq": eqFile = specs[1]
+        case "--start-ms": guard let t = Int64(specs[1]) else { usage() }; startMs = t
+        default: guard let o = Int64(specs[1]) else { usage() }; clockOffset = o
+        }
         specs.removeFirst(2)
     }
     let fs = 44100.0
     let idle = Int(0.080 * fs)      // 輸入落後超過 80 ms 才當成斷流補靜音；一般抖動（±20 ms）不動作
     let maxAhead = Int(0.060 * fs)  // 輸入比基準超前 60 ms 以上就丟
+    let chunk = Int(0.020 * fs)     // tap 一塊的長度（run_pair 的 audiotee --chunk-duration 0.02）
     enum Mode { case left, right, both, zero, closed }
     func parseMode(_ m: Substring) -> Mode? {
         switch m {
@@ -247,8 +252,14 @@ func split(_ argv: [String]) {
     var tv = timespec()
     clock_gettime(CLOCK_REALTIME, &tv)
     err(String(format: "split: t0_unix=%.6f", Double(tv.tv_sec) + Double(tv.tv_nsec) / 1e9))  // 樣本 0 寫出的時間
+    // 和排定 T 的那一段用同一個位移，校時不會混進 lead
+    let unixOffsetNs = clockOffset ?? Int64(tv.tv_sec) * 1_000_000_000 + Int64(tv.tv_nsec) - t0
     var pending = [UInt8]()
     var silenceFrames = 0, droppedFrames = 0, lastLog = -1
+    var starved = true  // 還沒收到輸入，或斷流補過靜音：下一批輸入先補靜音到基準線再寫
+    // shortcut: 落後不到 idle 的短斷流若真的掉了資料（之後沒補送），延遲會少掉那一段；長時間播放的 lead_ms 看得出漂移再處理
+    // lead：收到的輸入離它排定播出還有多久（T + 寫到的 frame / 44.1 kHz − 收到的時刻），每 10 秒記一次，拆解延遲用
+    var leadMin = Double.infinity, leadMax = -Double.infinity, leadSum = 0.0, leadN = 0
     var buf = [UInt8](repeating: 0, count: 65536)
     var pfd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
     while true {
@@ -261,9 +272,24 @@ func split(_ argv: [String]) {
         pollEq(nowNs)
         let elapsed = Double(nowNs - t0) / 1e9
         let due = Int(elapsed * fs)  // 照牆鐘此刻應該輸出到第幾個 frame
+        if pending.count >= 4, starved {  // 先把 pipe 裡已經積著的都讀出來：同一批分幾次讀進來時，下面才不會只裁到第一次
+            // shortcut: audiotee 逐塊寫，讀空的當下它若還沒寫完積壓，剩下的一兩塊會走 maxAhead 被留下；sweep 印的 lead 與 T − t0 差超過約 25 ms 就要改成看一段時間內的積壓
+            while true {
+                let more = buf.withUnsafeMutableBytes { read(0, $0.baseAddress!, $0.count) }
+                if more <= 0 { break }
+                pending.append(contentsOf: buf[0..<more])
+            }
+        }
         let frames = pending.count / 4
         if frames > 0 {
-            let take = min(frames, max(0, due + maxAhead - written))
+            if starved, written < due {  // 晚到的那段補成靜音，這批才會在「收到時刻 + (T − t0)」播出，延遲固定
+                let zeros = [Int16](repeating: 0, count: (due - written) * 2)
+                silenceFrames += due - written
+                zeros.withUnsafeBufferPointer { emitAdvancing($0) }
+            }
+            // 起播或斷流後的第一批只留最新一塊：tap 先積了一些的話，舊樣本會把延遲永遠拉長那一段（maxAhead 只管 60 ms 以上）
+            let take = min(frames, max(0, due + (starved ? chunk : maxAhead) - written))
+            starved = false
             droppedFrames += frames - take
             if take > 0 {  // 丟最舊的、留最新的，延遲才不會被拉長
                 pending.withUnsafeBytes { raw in
@@ -275,6 +301,10 @@ func split(_ argv: [String]) {
                     eqBuf.withUnsafeMutableBufferPointer { eq.process($0) }
                     eqBuf.withUnsafeBufferPointer { emitAdvancing($0) }
                 }
+                if let t = startMs {
+                    let lead = Double(t) + Double(written) / fs * 1000 - Double(nowNs + unixOffsetNs) / 1e6
+                    leadMin = min(leadMin, lead); leadMax = max(leadMax, lead); leadSum += lead; leadN += 1
+                }
             }
             pending.removeFirst(frames * 4)
         } else if written < due - idle {  // 斷流：補靜音到基準線
@@ -282,14 +312,21 @@ func split(_ argv: [String]) {
             let zeros = [Int16](repeating: 0, count: gap * 2)
             zeros.withUnsafeBufferPointer { emitAdvancing($0) }
             silenceFrames += gap
+            starved = true
         }
         let sec = Int(elapsed)
-        if sec % 10 == 0, sec != lastLog, silenceFrames > 0 || droppedFrames > 0 {
+        if sec % 10 == 0, sec != lastLog {
             lastLog = sec
-            err(String(format: "split: 補靜音 %.0f ms，丟棄 %.0f ms",
-                       Double(silenceFrames) / fs * 1000, Double(droppedFrames) / fs * 1000))
-            silenceFrames = 0
-            droppedFrames = 0
+            if silenceFrames > 0 || droppedFrames > 0 {
+                err(String(format: "split: 補靜音 %.0f ms，丟棄 %.0f ms",
+                           Double(silenceFrames) / fs * 1000, Double(droppedFrames) / fs * 1000))
+            }
+            if leadN > 0 {
+                err(String(format: "split: lead_ms min=%.1f avg=%.1f max=%.1f reads=%d",
+                           leadMin, leadSum / Double(leadN), leadMax, leadN))
+            }
+            silenceFrames = 0; droppedFrames = 0
+            leadMin = .infinity; leadMax = -.infinity; leadSum = 0; leadN = 0
         }
     }
 }

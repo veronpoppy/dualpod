@@ -37,9 +37,10 @@ You need an Apple silicon Mac on macOS 14.4 or later, and Xcode or the Command L
 
 Match the style of the code around your change, and write comments that explain why, not what.
 
-1. Fork and clone the repository, then build from its root:
+1. Fork and clone the repository, switch to the `dev` branch, then build from its root:
 
    ```bash
+   git switch dev
    zsh scripts/fetch-deps.sh
    zsh app/build.sh
    ```
@@ -61,9 +62,17 @@ Match the style of the code around your change, and write comments that explain 
 
 3. If you have HomePods, play audio through them and check the part you changed. If you can't, say so in the pull request, and the maintainer will test it.
 
+4. Check that your commits carry no personal data. Logs and test notes easily pick up your home folder path, local IP addresses, MAC addresses or HomePod device IDs. Turn on the pre-push check once, and every push runs it (it needs zsh, which macOS has by default):
+
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+
+   To check by hand, run `zsh scripts/check-private.sh origin/dev`. It scans the lines your commits add and their messages. If a flagged line is fine, such as a documented example, add `check-private: allow` to it.
+
 ### Send it
 
-Push a branch to your fork and open the pull request against `main`. In the description, say what changed and which HomePod models and software versions you tested with, if any. Link the issue if there is one. For a bug fix without an issue, include what [Reporting a bug](#reporting-a-bug) asks for: the diagnostics, the HomePod model and software version, and what you did, expected, and saw. Keep "Allow edits from maintainers" on, so small fixes can be pushed to your branch instead of going back and forth.
+Push a branch to your fork and open the pull request against `dev`. `main` only changes when a version is released, so a pull request against `main` will be retargeted. In the description, say what changed and which HomePod models and software versions you tested with, if any. Link the issue if there is one. For a bug fix without an issue, include what [Reporting a bug](#reporting-a-bug) asks for: the diagnostics, the HomePod model and software version, and what you did, expected, and saw. Keep "Allow edits from maintainers" on, so small fixes can be pushed to your branch instead of going back and forth.
 
 ## License
 

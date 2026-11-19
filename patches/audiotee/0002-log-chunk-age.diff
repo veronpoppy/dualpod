@@ -1,0 +1,109 @@
+Modified by DualPod, 2026-11: log, every 10 seconds, the age of the last source sample in the last chunk each capture callback writes out.
+
+diff --git a/Sources/AudioTeeCore/Core/AudioBuffer.swift b/Sources/AudioTeeCore/Core/AudioBuffer.swift
+index 7b5c781..4c2bc1f 100644
+--- a/Sources/AudioTeeCore/Core/AudioBuffer.swift
++++ b/Sources/AudioTeeCore/Core/AudioBuffer.swift
+@@ -15,7 +15,7 @@ public class AudioBuffer {
+   private let linearizationBuffer: UnsafeMutableRawPointer
+   private var writeIndex: Int = 0
+   private var readIndex: Int = 0
+-  private var availableBytes: Int = 0
++  public private(set) var availableBytes: Int = 0
+   private let maxBufferSize: Int
+ 
+   public let bytesPerChunk: Int
+diff --git a/Sources/AudioTeeCore/Core/AudioRecorder.swift b/Sources/AudioTeeCore/Core/AudioRecorder.swift
+index 6d8dce2..156ad94 100644
+--- a/Sources/AudioTeeCore/Core/AudioRecorder.swift
++++ b/Sources/AudioTeeCore/Core/AudioRecorder.swift
+@@ -9,6 +9,10 @@ public class AudioRecorder {
+   private var audioBuffer: AudioBuffer?
+   private var outputHandler: AudioOutputHandler
+   private var converter: AudioFormatConverter?
++  // DualPod：每 10 秒記一次「最新一塊從錄到到寫進 stdout 經過多久」，拆解延遲用
++  private var sourceRate = 0.0, bytesPerFrame = 1.0
++  private var ageMin = Double.infinity, ageMax = -Double.infinity, ageSum = 0.0, ageN = 0
++  private var ageLogNs: UInt64 = 0
+ 
+   /// The audio format this recorder produces (after any conversion).
+   public var outputFormat: AudioStreamBasicDescription {
+@@ -29,6 +33,8 @@ public class AudioRecorder {
+ 
+     // Get source format and set up conversion if requested
+     let sourceFormat = try AudioFormatManager.getDeviceFormat(deviceID: deviceID)
++    self.sourceRate = sourceFormat.mSampleRate
++    self.bytesPerFrame = Double(max(1, sourceFormat.mBytesPerFrame))
+ 
+     // Set up the audio buffer using source format and configurable chunk duration
+     self.audioBuffer = AudioBuffer(format: sourceFormat, chunkDuration: chunkDuration)
+@@ -86,7 +92,7 @@ public class AudioRecorder {
+         (inDevice, inNow, inInputData, inInputTime, outOutputData, inOutputTime, inClientData)
+           -> OSStatus in
+         let recorder = Unmanaged<AudioRecorder>.fromOpaque(inClientData!).takeUnretainedValue()
+-        return recorder.processAudio(inInputData)
++        return recorder.processAudio(inInputData, inInputTime)
+       },
+       Unmanaged.passUnretained(self).toOpaque(),
+       &ioProcID
+@@ -105,7 +111,9 @@ public class AudioRecorder {
+     }
+   }
+ 
+-  private func processAudio(_ inputData: UnsafePointer<AudioBufferList>) -> OSStatus {
++  private func processAudio(
++    _ inputData: UnsafePointer<AudioBufferList>, _ inputTime: UnsafePointer<AudioTimeStamp>
++  ) -> OSStatus {
+     let bufferList = inputData.pointee
+     let firstBuffer = bufferList.mBuffers
+ 
+@@ -120,11 +128,49 @@ public class AudioRecorder {
+     // of this callback, so this is safe.
+     audioBuffer?.append(from: sourcePointer, count: Int(firstBuffer.mDataByteSize))
+ 
++    let before = audioBuffer?.availableBytes ?? 0
+     processAudioBuffer()
++    if let left = audioBuffer?.availableBytes, left < before,
++      inputTime.pointee.mFlags.contains(.hostTimeValid), sourceRate > 0
++    {
++      recordChunkAge(
++        inputHost: inputTime.pointee.mHostTime,
++        framesAfterLast: Double(left) / bytesPerFrame,
++        framesInCallback: Double(firstBuffer.mDataByteSize) / bytesPerFrame)
++    }
+ 
+     return noErr
+   }
+ 
++  /// 剛寫出那一塊的最後一個樣本：這次回呼第一個樣本的時間 + 回呼內位置（剩在 ring buffer 裡的不算）。
++  /// 量的是來源端；重採樣器本身的延遲不在內
++  private func recordChunkAge(inputHost: UInt64, framesAfterLast: Double, framesInCallback: Double) {
++    let nowNs = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime())
++    let firstNs = Double(AudioConvertHostTimeToNanos(inputHost))
++    let lastNs = firstNs + (framesInCallback - framesAfterLast - 1) / sourceRate * 1e9
++    let ms = (Double(nowNs) - lastNs) / 1e6
++    ageMin = min(ageMin, ms)
++    ageMax = max(ageMax, ms)
++    ageSum += ms
++    ageN += 1
++    if ageLogNs == 0 { ageLogNs = nowNs }
++    guard nowNs - ageLogNs >= 10_000_000_000 else { return }
++    ageLogNs = nowNs
++    let (lo, avg, hi, n) = (ageMin, ageSum / Double(ageN), ageMax, ageN)
++    DispatchQueue.global(qos: .utility).async {  // 格式化與寫 stderr 不在即時執行緒上做
++      AudioTeeLogging.logger.info(
++        "chunk age",
++        context: [
++          "min_ms": String(format: "%.1f", lo), "avg_ms": String(format: "%.1f", avg),
++          "max_ms": String(format: "%.1f", hi), "callbacks": String(n),
++        ])
++    }
++    ageMin = .infinity
++    ageMax = -.infinity
++    ageSum = 0
++    ageN = 0
++  }
++
+   public func stopRecording() {
+     processAudioBuffer()
+     outputHandler.handleStreamStop()

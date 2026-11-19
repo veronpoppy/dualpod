@@ -20,7 +20,8 @@ EQFILE=$STATE/eq  # 等化器五段 dB（80 250 1k 4k 12k Hz），serve 從使�
 RUNDIR_FILE=$STATE/rundir  # 目前 run_pair 的暫存資料夾（裡面有每台的 cmd 管道）
 SPEAKERS=$STATE/speakers  # 找到的喇叭：「ID<tab>IP<tab>名稱」，App 也讀這份
 DEVICES=${DEVICES:-}
-LATENCY=200 TARGET=200  # 實測最低又穩定的組合；再低會單台 REANCHOR、左右錯開
+LATENCY=200 TARGET=200  # 預設。11-12 實測再低會單台 REANCHOR，但當時 split 起播位置還會隨機少 0–80 ms（6dfdb28 已修）
+[[ ${BUFFER_MS:-} == <120-500> ]] && LATENCY=$BUFFER_MS TARGET=$BUFFER_MS  # 設定視窗選的緩衝（serve 從使用者的 buffer-ms 讀來）
 # 任何一行出現就代表兩台可能不再對齊（單台平移時間軸、斷流、結束）
 BAD='REANCHOR|anchor_corrected|content_cut|\[STATUS\] (error|eof|stopped)|PCM input starved|Splice-padded'
 MAX_RESTARTS=5 WINDOW_S=300 POLL_S=${POLL_S:-2}
@@ -140,6 +141,20 @@ taken_speakers() {  # stamp
   done
   print -r -- ${(u)taken}
 }
+# 系統能力的音訊位元（kIOPMSystemCapabilityAudio＝4）沒開就是睡眠或 DarkWake。讀不到就當醒著
+awake() {
+  local c=${POWER_CAPS:-$(ioreg -n IOPMrootDomain -d1 -r 2>/dev/null | sed -n 's/.*"System Capabilities" = \([0-9]*\).*/\1/p' | head -1)}
+  [[ $c != <-> ]] || (( c & 4 ))
+}
+# 和 run_pair 一樣要預設路由那張網卡有 IPv4（run_pair 拿它當 --if）。剛醒來 Wi-Fi 常晚幾秒，這時起播只會白白失敗
+# shortcut: 有 IPv4 不代表喇叭已經連得到，醒來後仍可能多失敗一兩次；真的遇到再加 ping 喇叭
+net_ready() { [[ -n $(ipconfig getifaddr $(route -n get default 2>/dev/null | awk '/interface:/ {print $2}') 2>/dev/null) ]] }
+# 核心記的上次入睡時間（kern.sleeptime）晚於給定時刻，就是之後睡過。讀不到當沒睡過
+slept_since() {
+  local w=(${=$(sysctl -n kern.sleeptime 2>/dev/null)})  # { sec = 1795013485, usec = … }
+  local t=${${w[4]:-}%,}
+  [[ $t == <-> ]] && (( t > $1 ))
+}
 
 supervise() {
   trap '' HUP
@@ -150,10 +165,18 @@ supervise() {
   local stamp="" snap reason now recent t began_at=0 summarized=""
   # 收到停止時，這段還沒寫摘要才補一列（重啟等待中收到的不重複記）
   trap 'say "stop requested"; [[ -n ${child:-} ]] && kill -TERM $child 2>/dev/null; stop_all; [[ -n $stamp && $stamp != $summarized ]] && summarize $stamp user_stop $began_at; rm -f $PIDFILE; exit 0' TERM INT
+  local ended=0
   while true; do
+    slept_since $ended && restarts=()  # 上一段結束後睡過，醒來重新計算次數
+    # 睡眠、DarkWake、剛醒網路還沒回來時都不起播：這時一定失敗，只會把重啟次數用光（等多久都不算次數）
+    if ! { awake && net_ready }; then
+      say "waiting for full wake and network"
+      until awake && net_ready; do sleep $POLL_S & wait $!; done
+      say "awake: connecting"
+    fi
     reread_devices
     stamp=$(date +%y%m%d-%H%M%S) began_at=$(date +%s)  # 含日期：跨日同一秒不會覆寫還在保留期的 log
-    say "start $DEVICES left=${LEFT:-} mac_sync_ms=${LOCAL_ADJ_MS:-0} (log tag $stamp)"
+    say "start $DEVICES left=${LEFT:-} mac_sync_ms=${LOCAL_ADJ_MS:-0} buffer_ms=$TARGET (log tag $stamp)"
     SPEAKERS=$SPEAKERS VOLFILE=$VOLFILE RUNDIR_FILE=$RUNDIR_FILE DEVICES=$DEVICES STAMP=$stamp DEBUG=3 zsh $RUN_PAIR live $LATENCY $TARGET >> $LOG 2>&1 &
     child=$!
     reason="" began=$SECONDS
@@ -183,6 +206,8 @@ supervise() {
     fi
     summarize $stamp ${reason%%:*} $began_at
     summarized=$stamp
+    ended=$(date +%s)
+    if ! awake || slept_since $began_at; then restarts=(); continue; fi  # 睡眠造成的中斷不算，醒來從頭計算
     now=$(date +%s); restarts+=($now); recent=0
     for t in $restarts; do (( now - t < WINDOW_S )) && (( recent++ )); done
     if (( recent > MAX_RESTARTS )); then
@@ -283,7 +308,8 @@ known() { [[ $1 == [0-9A-F](#c12) ]] && grep -q "^$1"$'\t' $SPEAKERS 2>/dev/null
 # Sound Glow（HomePod 27.2 頂端燈光）：燈色取自 Now Playing 封面的主色。實測只傳音訊不會亮；SENDMETA 會亮但是白色，
 # 之後單獨送 ARTWORK= 才會換成那張圖的主色。cliairplay 會忽略和上一張位元組相同的封面，所以封面一律只用 ARTWORK=、不附在 SENDMETA。
 # 顏色名稱表只在這裡（App 的色票另存一份顯示用，名稱要一致）
-typeset -A GLOW_PRESETS=(warm "FF2D2D FF8C00 FFD400" cool "1E40FF 8A2BE2 00B4FF" aurora "00C853 00E5C0 7CFC00" candy "FF4FA3 B14CFF 4CC9FF")
+# 每組最後加一條黑：11-18 盲測同一個粉紅加黑 4、4 分，只有粉紅 2、2 分（1–5 分），封面有暗的部分燈的明暗起伏才明顯（#1）
+typeset -A GLOW_PRESETS=(warm "FF2D2D FF8C00 FFD400 000000" cool "1E40FF 8A2BE2 00B4FF 000000" aurora "00C853 00E5C0 7CFC00 000000" candy "FF4FA3 B14CFF 4CC9FF 000000")
 GLOW_DELAY=${GLOW_DELAY:-2}  # SENDMETA 會把顏色重設成白色；是否要隔一段才送封面沒實測過，先等這幾秒
 typeset -A glow_sent  # 每個 cmd 管道收過什麼：「meta@<該送封面的 SECONDS>」或「art:<封面檔名>」；沒有這個鍵就是什麼都沒收過
 glow_rd=""
@@ -402,11 +428,14 @@ case ${1:-status} in
       done
       [[ $line == "ready "<->" ."<-> ]] || exit 1
       SFX[$j]=${line##* }
-      # T2 比現在晚 600 ms：split 要在 T2 − TARGET（200）就寫到那個 frame，它最多超前 60 ms、每 100 ms 才讀一次路由檔；
+      # T2 比現在晚 max(600, TARGET + 400) ms：split 要在 T2 − TARGET 就寫到那個 frame，它最多超前 60 ms、每 100 ms 才讀一次路由檔；
       # 之後 cliairplay 還要求 START 至少早 250 ms 送到。時鐘剛就緒時 ready_at 可能還在未來，取較晚的
+      st=$(cat $rd/latency 2>/dev/null)  # run_pair 寫的，等於 TARGET；不合就當預設
+      [[ $st == <120-500> ]] || st=200
       nowms=$($TOOL now $off)
       T2=${${line#ready }% *}
-      (( T2 < nowms + 600 )) && T2=$(( nowms + 600 ))
+      min2=$(( st + 400 > 600 ? st + 400 : 600 ))
+      (( T2 < nowms + min2 )) && T2=$(( nowms + min2 ))
       (( T2 - nowms <= 3000 )) || exit 1
       tag=@$T2
     fi
@@ -475,8 +504,8 @@ case ${1:-status} in
       done
       want=${want% }
       [[ -z $want ]] && want=off || want+=$mac
-      # 設定視窗改的值（Mac 對齊、哪台當左聲道）只在起播時讀；改了而且正在播，就重新起播套用
-      cfg=$(stat -f '%Fm %i' $dir/mac-sync-ms $dir/left 2>/dev/null | tr '\n' ' ')
+      # 設定視窗改的值（Mac 對齊、哪台當左聲道、緩衝）只在起播時讀；改了而且正在播，就重新起播套用
+      cfg=$(stat -f '%Fm %i' $dir/mac-sync-ms $dir/left $dir/buffer-ms 2>/dev/null | tr '\n' ' ')
       cfg_changed=""
       [[ -n ${clast+x} && $cfg != $clast ]] && cfg_changed=1
       clast=$cfg
@@ -495,7 +524,8 @@ case ${1:-status} in
           # 只是裝置組合變動（少一台、開關 Mac）就不中斷留下的輸出；reroute 做不到才關了再開
           if ! { [[ -z $cfg_changed ]] && running && LEFT=$left zsh $0 reroute ${=want} }; then
             running && zsh $0 off
-            LEFT=$left LOCAL_ADJ_MS=$adj zsh $0 on ${=want}
+            buf=$(read_user $dir/buffer-ms | tr -d ' \n')  # 範圍由 on 那邊的 <120-500> 驗證，不合就用預設
+            LEFT=$left LOCAL_ADJ_MS=$adj BUFFER_MS=$buf zsh $0 on ${=want}
           else vdone=""  # 播放中加入的那台也要收到存成 0 的音量
           fi
         fi

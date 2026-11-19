@@ -25,9 +25,10 @@ PY
 $T glowart $S/one.jpg FF2D2D || fail "1 色"; check one.jpg FF2D2D
 $T glowart $S/two.jpg 1E40FF ffd400 || fail "2 色"; check two.jpg 1E40FF FFD400
 $T glowart $S/three.jpg 00C853 8A2BE2 00B4FF || fail "3 色"; check three.jpg 00C853 8A2BE2 00B4FF
+$T glowart $S/four.jpg FF4FA3 B14CFF 4CC9FF 000000 || fail "4 色"; check four.jpg FF4FA3 B14CFF 4CC9FF 000000
 $T glowart $S/one.jpg 0000FF || fail "覆寫"; check one.jpg 0000FF
 [[ -z "$(print -l $S/*.tmp*(N))" ]] || fail "留下暫存檔"
-for bad in "" "GGGGGG" "FFF" "FF2D2D1" "#FF2D2D" "FF2D2D 00 11" "FF0000 00FF00 0000FF FFFFFF" "../x" "ＦＦ００００"; do
+for bad in "" "GGGGGG" "FFF" "FF2D2D1" "#FF2D2D" "FF2D2D 00 11" "FF0000 00FF00 0000FF FFFFFF 000000" "../x" "ＦＦ００００"; do
   $T glowart $S/bad.jpg ${=bad} 2>/dev/null && fail "[$bad] 應該失敗"
 done
 $T glowart 2>/dev/null && fail "沒有參數應該失敗"

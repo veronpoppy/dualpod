@@ -1,0 +1,95 @@
+Modified by DualPod, 2026-11: log retransmit requests at the default level, with how long after sending each packet was requested.
+
+diff --git a/src/ap2_client.c b/src/ap2_client.c
+index 635206d..67923a7 100644
+--- a/src/ap2_client.c
++++ b/src/ap2_client.c
+@@ -191,6 +191,7 @@ struct ap2_rtx_slot {
+     uint16_t seq;
+     uint16_t len;
+     bool valid;
++    uint64_t stored_ms;  /* when it went out: a request's age shows how late the receiver noticed the loss */
+     uint8_t data[AP2_RTX_MAX_PKT];
+ };
+ 
+@@ -984,7 +985,9 @@ static void ap2_rtx_store(struct ap2cl_s *p, uint16_t seq,
+         return;
+     }
+     struct ap2_rtx_slot *slot = &p->rtx_ring[seq % AP2_RTX_RING_SLOTS];
++    uint64_t now = ap2_io_monotonic_ms();
+     pthread_mutex_lock(&p->rtx_lock);
++    slot->stored_ms = now;
+     slot->seq = seq;
+     slot->len = (uint16_t)len;
+     slot->valid = true;
+@@ -996,7 +999,8 @@ static void ap2_rtx_store(struct ap2cl_s *p, uint16_t seq,
+  * resend: a 4-byte control header (marker | type 0x56, echoing the request's
+  * own sequence) wrapping the original packet verbatim. */
+ static bool ap2_rtx_resend(struct ap2cl_s *p, uint16_t seq, uint16_t req_seq,
+-                           const struct sockaddr_in *to)
++                           const struct sockaddr_in *to, uint64_t req_ms,
++                           uint64_t *age_ms)
+ {
+     if (!p->rtx_ring) return false;
+     uint8_t out[4 + AP2_RTX_MAX_PKT];
+@@ -1006,6 +1010,7 @@ static bool ap2_rtx_resend(struct ap2cl_s *p, uint16_t seq, uint16_t req_seq,
+     if (slot->valid && slot->seq == seq) {
+         len = slot->len;
+         memcpy(out + 4, slot->data, (size_t)len);
++        *age_ms = req_ms > slot->stored_ms ? req_ms - slot->stored_ms : 0;
+     }
+     pthread_mutex_unlock(&p->rtx_lock);
+     if (!len) {
+@@ -1035,6 +1040,7 @@ static void *ap2_rtx_thread_main(void *arg)
+ {
+     struct ap2cl_s *p = arg;
+     uint64_t last_report = ap2_io_monotonic_ms();
++    uint64_t age_n = 0, age_sum = 0, age_max = 0;  /* requests answered since the last report */
+     LOG_DEBUG("[AP2] retransmit responder started (ring=%d packets)",
+               AP2_RTX_RING_SLOTS);
+     while (!atomic_load(&p->rtx_stop)) {
+@@ -1061,24 +1067,34 @@ static void *ap2_rtx_thread_main(void *arg)
+                 if (!count || count > AP2_RTX_RING_SLOTS)
+                     count = count ? AP2_RTX_RING_SLOTS : 1;
+                 atomic_fetch_add(&p->rtx_requested, count);
+-                for (uint16_t k = 0; k < count; k++)
+-                    ap2_rtx_resend(p, (uint16_t)(first + k), req_seq, &from);
++                uint64_t req_ms = ap2_io_monotonic_ms();  /* one arrival time per request: earlier resends must not age the later ones */
++                for (uint16_t k = 0; k < count; k++) {
++                    uint64_t age = UINT64_MAX;  /* stays unset when the packet already left the ring */
++                    ap2_rtx_resend(p, (uint16_t)(first + k), req_seq, &from, req_ms, &age);
++                    if (age != UINT64_MAX) {
++                        age_n++; age_sum += age;
++                        if (age > age_max) age_max = age;
++                    }
++                }
+             }
+         }
+         uint64_t now = ap2_io_monotonic_ms();
+         unsigned long long asked = atomic_load(&p->rtx_requested);
+         if (asked && now - last_report >= 5000) {
+             last_report = now;
+-            LOG_DEBUG("[AP2] retransmit: %llu requested, %llu resent, "
+-                      "%llu already retired",
+-                      asked, atomic_load(&p->rtx_answered),
+-                      atomic_load(&p->rtx_expired));
++            LOG_INFO("[AP2] retransmit: %llu requested, %llu resent, "
++                     "%llu already retired; last 5 s: %llu found, age avg %llu max %llu ms",
++                     asked, atomic_load(&p->rtx_answered),
++                     atomic_load(&p->rtx_expired), age_n,
++                     age_n ? age_sum / age_n : 0, age_max);
++            age_n = age_sum = age_max = 0;
+         }
+     }
+-    LOG_DEBUG("[AP2] retransmit responder stopped (%llu requested, %llu resent, "
+-              "%llu already retired)",
+-              atomic_load(&p->rtx_requested), atomic_load(&p->rtx_answered),
+-              atomic_load(&p->rtx_expired));
++    LOG_INFO("[AP2] retransmit: %llu requested, %llu resent, "
++             "%llu already retired; last 5 s: %llu found, age avg %llu max %llu ms (stopped)",
++             atomic_load(&p->rtx_requested), atomic_load(&p->rtx_answered),
++             atomic_load(&p->rtx_expired), age_n,
++             age_n ? age_sum / age_n : 0, age_max);
+     return NULL;
+ }
+ 
